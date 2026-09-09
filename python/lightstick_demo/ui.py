@@ -16,6 +16,8 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from . import __version__
+from .engine import Engine
+from .model import LogicalUpdate, RadioSettings
 from .controller import (
     Controller,
     TX_POLL_MIN_TIMEOUT_SECONDS,
@@ -267,12 +269,8 @@ class LightstickApp(tk.Tk):
         self._record_valid_data_seen = False
         self.c0_colors = [0] * 10
         self._state_store = state_store or StateStore()
-        try:
-            self._d8_slots = tuple(self._state_store.load_unlocked()["d8_slots"])
-        except StateError:
-            # Preview construction will surface the persistent-state error.
-            # Do not overwrite a malformed state file with a guessed default.
-            self._d8_slots = DEFAULT_D8_SLOTS
+        self.engine = Engine(store=self._state_store)
+        self.engine.start()
         self._busy_tasks: set[str] = set()
         self._task_callbacks: dict[str, tuple[str, Callable[[Any], None] | None, Callable[[str], None] | None]] = {}
         self._preview_valid = False
@@ -284,6 +282,12 @@ class LightstickApp(tk.Tk):
         self._build_header()
         self._build_tabs()
         self.after(80, self._poll_worker_events)
+        self.after(200, self._refresh_engine_status)
+
+    def _refresh_engine_status(self):
+        tx = self.engine.status()['tx']
+        self.air_activity_var.set(f"TX: {tx['running']}  Pending: {tx['pending']}  Received: {tx['received']}  Dedupe: {tx['deduplicated']}  Coalesced: {tx['coalesced']}  TX: {tx['transmitted']}  Failed: {tx['failed']}  {tx['error']}")
+        self.after(200, self._refresh_engine_status)
 
     def _build_style(self) -> None:
         style = ttk.Style(self)
@@ -347,14 +351,14 @@ class LightstickApp(tk.Tk):
         ttk.Label(preview, text="命令预览：").grid(row=0, column=0, sticky="w")
         self._readonly_entry(preview, self.preview_var, 98).grid(row=0, column=1, sticky="ew")
 
-        self.air_family_var = tk.StringVar(value="00")
+        self._protocol_names = {plugin.display_name: key for key, plugin in self.engine.registry.plugins.items()}
+        self.air_family_var = tk.StringVar(value=self.engine.protocol.display_name)
         family = ttk.Frame(tab)
         family.grid(row=1, column=0, sticky="ew", pady=(0, 5))
-        ttk.Label(family, text="命令族：").grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(family, text="00", variable=self.air_family_var, value="00").grid(row=0, column=1, sticky="w")
-        ttk.Radiobutton(family, text="D8", variable=self.air_family_var, value="D8").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        ttk.Label(family, text='协议：').grid(row=0, column=0, sticky='w')
+        ttk.Combobox(family, textvariable=self.air_family_var, values=tuple(self._protocol_names), state='readonly', width=18).grid(row=0, column=1)
         self.d8_hex_var = tk.StringVar(value="#FF0000")
-        self.d8_hex_label = ttk.Label(family, text="D8 RGB：")
+        self.d8_hex_label = ttk.Label(family, text="RGB：")
         self.d8_hex_entry = ttk.Entry(family, textvariable=self.d8_hex_var, width=12)
         self.d8_hex_label.grid(row=0, column=3, sticky="e", padx=(26, 4))
         self.d8_hex_entry.grid(row=0, column=4, sticky="w")
@@ -363,7 +367,7 @@ class LightstickApp(tk.Tk):
         zones.grid(row=2, column=0, sticky="ew", pady=(0, 7))
         ttk.Label(zones, text="组别：").grid(row=0, column=0, sticky="w")
         self.all_zones_var = tk.BooleanVar(value=False)
-        self.zone_vars = {chr(ord("A") + index): tk.BooleanVar(value=index == 0) for index in range(16)}
+        self.zone_vars = {zone: tk.BooleanVar(value=index == 0) for index, zone in enumerate(dict.fromkeys(z for p in self.engine.registry.plugins.values() for z in p.capabilities.zones))}
         self.zone_buttons: list[ttk.Checkbutton] = []
         all_button = ttk.Checkbutton(zones, text="全选", variable=self.all_zones_var, command=self._toggle_all_zones)
         all_button.grid(row=0, column=1, sticky="w", padx=(0, 5))
@@ -460,47 +464,40 @@ class LightstickApp(tk.Tk):
 
     def _toggle_all_zones(self) -> None:
         selected = self.all_zones_var.get()
-        active_zones = D8_ZONES if self.air_family_var.get() == "D8" else tuple(self.zone_vars)
+        active_zones = self.engine.protocol.capabilities.zones
         for zone, variable in self.zone_vars.items():
             variable.set(selected if zone in active_zones else False)
         self.refresh_preview()
 
     def _zone_changed(self) -> None:
-        active_zones = D8_ZONES if self.air_family_var.get() == "D8" else tuple(self.zone_vars)
+        active_zones = self.engine.protocol.capabilities.zones
         self.all_zones_var.set(all(self.zone_vars[zone].get() for zone in active_zones))
         self.refresh_preview()
 
-    def _family_changed(self) -> None:
-        is_d8 = self.air_family_var.get() == "D8"
-        # D8's nine position-based candidates are A-I.  Keep the A-P
-        # controls visible for the short 00/DA commands, but make J-P
-        # unavailable while D8 is selected.
-        self.zone_buttons[0].state(["!disabled"])
+    def _family_changed(self):
+        selected = self._protocol_names[self.air_family_var.get()]
+        try:
+            self.engine.select_protocol(selected)
+        except Exception as exc:
+            self.air_activity_var.set(str(exc))
+            return
+        caps = self.engine.protocol.capabilities
         for zone, button in zip(self.zone_vars, self.zone_buttons[1:]):
-            button.state(["disabled"] if is_d8 and zone not in D8_ZONES else ["!disabled"])
-        if is_d8:
-            for zone in self.zone_vars:
-                if zone not in D8_ZONES:
-                    self.zone_vars[zone].set(False)
-        if is_d8:
-            self.d8_hex_label.grid()
-            self.d8_hex_entry.grid()
-            self.d8_hex_entry.configure(state="normal")
-        else:
-            self.d8_hex_label.grid_remove()
-            self.d8_hex_entry.grid_remove()
-            self.d8_hex_entry.configure(state="disabled")
-        for state, button in self.function_buttons.items():
-            button.state(["disabled"] if is_d8 and state in D8_DISABLED_STATES else ["!disabled"])
-        if is_d8 and self.command_state_var.get() in D8_DISABLED_STATES:
-            self.command_state_var.set("常亮")
-        if is_d8:
-            self.d8_hex_var.set(palette_hex(self.color_var.get()))
+            button.state(['!disabled'] if zone in caps.zones else ['disabled'])
+            if zone not in caps.zones:
+                self.zone_vars[zone].set(False)
+        for widget in (self.d8_hex_label, self.d8_hex_entry):
+            widget.grid() if caps.color_mode == 'rgb' else widget.grid_remove()
+        effects = {'熄灭':'off','常亮':'solid','慢闪':'slow','中闪':'medium','快闪':'fast',
+                   '保持':'hold','Fade in':'fade_in','Fade out':'fade_out'}
+        for label, button in self.function_buttons.items():
+            button.state(['!disabled'] if effects[label] in caps.effects else ['disabled'])
+        if effects[self.command_state_var.get()] not in caps.effects:
+            self.command_state_var.set('常亮')
         self._zone_changed()
 
-    def _color_changed(self) -> None:
-        if self.air_family_var.get() == "D8":
-            self.d8_hex_var.set(palette_hex(self.color_var.get()))
+    def _color_changed(self):
+        self.d8_hex_var.set(palette_hex(self.color_var.get()))
         self.refresh_preview()
 
     def _update_power_label(self) -> None:
@@ -509,38 +506,15 @@ class LightstickApp(tk.Tk):
     def _selected_zones(self) -> list[str]:
         return [zone for zone, variable in self.zone_vars.items() if variable.get()]
 
-    def _selected_d8_zones(self) -> list[str]:
-        return [zone for zone in D8_ZONES if self.zone_vars[zone].get()]
+    def _current_update(self):
+        effects = {'熄灭':'off','常亮':'solid','慢闪':'slow','中闪':'medium','快闪':'fast',
+                   '保持':'hold','Fade in':'fade_in','Fade out':'fade_out'}
+        rgb = d8_rgb_from_hex(self.d8_hex_var.get())
+        palette = self.color_var.get() if self.engine.protocol.capabilities.color_mode == 'palette' else None
+        return LogicalUpdate(tuple(self._selected_zones()), rgb, effects[self.command_state_var.get()], palette)
 
-    def _current_d8_word(self) -> int:
-        state_name = self.command_state_var.get()
-        function = D8_FUNCTIONS.get(state_name)
-        if state_name == "熄灭":
-            red = green = blue = function = 0
-        elif function is None:
-            raise ValueError("D8 仅支持熄灭、常亮和三档闪烁")
-        else:
-            red, green, blue = d8_rgb_from_hex(self.d8_hex_var.get())
-        return d8_word(red, green, blue, function)
-
-    def _load_persistent_d8_slots(self) -> tuple[int, ...]:
-        slots = tuple(self._state_store.load_unlocked()["d8_slots"])
-        self._d8_slots = slots
-        return slots
-
-    def _current_d8_slots(self) -> tuple[int, ...]:
-        return d8_update_slots(
-            self._load_persistent_d8_slots(),
-            self._selected_d8_zones(),
-            self._current_d8_word(),
-        )
-
-    def _current_frames(self) -> tuple[bytes, ...]:
-        if self.air_family_var.get() == "00":
-            mask1, mask2 = zone_mask(self._selected_zones())
-            state = COMMAND_STATES[self.command_state_var.get()]
-            return (build_partition_frame(mask1, mask2, 0xFF, state, self.color_var.get()),)
-        return build_d8_frames_from_slots(self._current_d8_slots(), DEFAULT_D8_PHASES)
+    def _current_frames(self):
+        return self.engine.preview(self._current_update()).frames
 
     def refresh_preview(self) -> None:
         try:
@@ -577,73 +551,21 @@ class LightstickApp(tk.Tk):
             raise ValueError("功率必须为 -30..10 dBm")
         return frequency, repeat, gap_us, power
 
-    def _start_air_tx(self, frames: tuple[bytes, ...] | None = None) -> None:
-        transport = self._connected_transport("无法发射")
-        if transport is None:
+    def _start_air_tx(self, frames=None):
+        if self._connected_transport('无法发射') is None:
             return
-        d8_transaction = self.air_family_var.get() == "D8" and frames is None
-        d8_zones: tuple[str, ...] | None = None
-        d8_control_word: int | None = None
         try:
-            frequency, repeat, gap_us, power = self._tx_settings()
-            if d8_transaction:
-                d8_zones = tuple(self._selected_d8_zones())
-                d8_control_word = self._current_d8_word()
-                # Validate the current shared state and preview candidate now;
-                # the worker reloads it under the process lock before TX.
-                d8_update_slots(self._load_persistent_d8_slots(), d8_zones, d8_control_word)
-                pulses = ()
-            else:
-                current = frames if frames is not None else self._current_frames()
-                pulses = tuple(encode_air_pulses(frame) for frame in current)
-        except Exception as exc:
-            self._show_error("发射参数无效", str(exc))
-            return
-        if "air-tx" in self._busy_tasks:
-            self.air_activity_var.set("正在发射")
-            return
-
-        def operation() -> Any:
-            if d8_transaction:
-                assert d8_zones is not None and d8_control_word is not None
-                return self._execute_persistent_d8_tx(
-                    transport,
-                    d8_zones,
-                    d8_control_word,
-                    frequency,
-                    power,
-                    gap_us,
-                )
-            commands = [
-                (
-                    "TX_PULSES",
-                    tx_pulses_args(
-                        pulse,
-                        frequency,
-                        power,
-                        repeat if len(pulses) == 1 else 1,
-                        gap_us,
-                    ),
-                )
-                for pulse in pulses
-            ]
-            return self._execute_tx(transport, commands)
-
-        self.air_activity_var.set("正在发射并等待 TX 结果")
-        def completed(value: Any) -> None:
-            if d8_transaction:
-                self._d8_slots = value.candidate_slots
-                self.air_activity_var.set(d8_tx_completion_text(value.state_changed))
+            frequency, repeat, gap, power = self._tx_settings()
+            self.engine.radio = RadioSettings(frequency, power, repeat, gap)
+            if frames is None:
+                self.engine.submit_update(self._current_update())
                 return
-            self.air_activity_var.set(f"发射完成：{len(value)} 个 TX 结果成功")
-
-        self._submit(
-            "air-tx",
-            operation,
-            "发射完成",
-            completed,
-            lambda detail: self.air_activity_var.set(f"发射失败：{detail}"),
-        )
+            commands = [('TX_PULSES', tx_pulses_args(encode_air_pulses(frame), frequency, power, repeat, gap)) for frame in frames]
+        except Exception as exc:
+            self._show_error('发射参数无效', str(exc))
+            return
+        self._submit('air-tx', lambda: self.engine.execute_commands(commands), '发射完成',
+                     lambda value: self.air_activity_var.set('Bridge TX 完成；无目标 ACK'))
 
     def open_c0_dialog(self) -> None:
         dialog = self._modal(self, "所有分区变色", "520x330")
@@ -746,7 +668,7 @@ class LightstickApp(tk.Tk):
         return self.transport
 
     def _execute_tx(self, transport: BaseTransport, commands: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
-        return Controller(transport).execute_commands(commands)
+        return self.engine.execute_commands(commands)
 
     def _execute_persistent_d8_tx(
         self,
@@ -804,7 +726,14 @@ class LightstickApp(tk.Tk):
         if not isinstance(transport, BaseTransport):
             self._show_error("连接失败", "传输实例无效")
             return
-        old = self.transport
+        try:
+            self.engine.attach(transport)
+            self.engine.start()
+        except Exception as exc:
+            transport.disconnect()
+            self._show_error('连接失败', str(exc))
+            return
+        old = None
         self.transport = transport
         self._update_transport_status(result["status"])
         if result["status"].kind == "USB Serial":
@@ -847,7 +776,7 @@ class LightstickApp(tk.Tk):
                 self._update_transport_status(status)
             self.transport = None
 
-        self._submit("disconnect", transport.disconnect, "已断开", finished)
+        self._submit("disconnect", self.engine.disconnect, "已断开", finished)
 
     def refresh_bridge_status(self) -> None:
         transport = self._connected_transport("无法刷新状态")
@@ -1312,6 +1241,7 @@ class LightstickApp(tk.Tk):
             if message:
                 self.esp_activity_var.set(message)
         self.after(80, self._poll_worker_events)
+        self.after(200, self._refresh_engine_status)
 
     def _handle_progress(self, event: WorkerEvent) -> None:
         if event.task not in {"recording", "record-recovery"} or not isinstance(event.value, dict):
@@ -1346,11 +1276,9 @@ class LightstickApp(tk.Tk):
         except tk.TclError:
             pass
 
-    def _close(self) -> None:
-        transport = self.transport
+    def _close(self):
+        self.engine.stop()
         self.transport = None
-        if transport is not None:
-            threading.Thread(target=self._best_effort_disconnect, args=(transport,), daemon=True).start()
         self.destroy()
 
 

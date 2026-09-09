@@ -28,6 +28,9 @@ from .protocol import (
     hex_bytes,
 )
 from .state import StateError, StateStore
+from .engine import Engine
+from .model import LogicalUpdate, RadioSettings
+from .protocols.registry import ProtocolRegistry
 from .transports import TransportError
 
 
@@ -59,8 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="A[,B]|all",
         help="D8 zone A-I; repeat or separate zones with commas",
     )
+    parser.add_argument("--protocol", default="protocol_d8", help="Protocol plugin ID")
     parser.add_argument("--rgb", required=True, metavar="RRGGBB", help="six-digit RGB colour")
-    parser.add_argument("--effect", choices=tuple(EFFECT_FUNCTIONS), default="solid")
+    parser.add_argument("--effect", choices=('solid','slow','medium','fast','off','fade_in','fade_out','hold'), default="solid")
     parser.add_argument("--transport", choices=("auto", "usb", "wifi", "ble"), default="auto")
     parser.add_argument(
         "--frequency",
@@ -175,60 +179,42 @@ def execute(
     discovery: AutoDiscovery | None = None,
 ) -> dict[str, Any]:
     store = store or StateStore()
-    discovery = discovery or AutoDiscovery()
-    with store.locked():
-        state = store.load_unlocked()
-        prepared = prepare_command(args, state["d8_slots"])
-        output = _base_output(args, prepared)
-        if args.dry_run:
-            output.update(
-                {
-                    "dry_run": True,
-                    "frames_hex": list(prepared.frames_hex),
-                    "transaction": {
-                        "command": "TX_PULSES",
-                        "frames": len(prepared.frames_hex),
-                        "pulse_durations": prepared.pulse_count,
-                        "duration_us": prepared.duration_us,
-                    },
-                }
-            )
-            return output
-
-        found = discovery.connect(args.transport, cached=state.get("connection"))
-        try:
-            state["connection"] = found.cache_entry
-            # Connectivity is useful independently of TX success.  The D8
-            # shadow remains unchanged until final TX completion.
-            store.save_unlocked(state)
-            persistent_tx = execute_persistent_d8_tx(
-                store,
-                found.transport,
-                prepared.zones,
-                prepared.word,
-                args.frequency_hz,
-                args.power_dbm,
-                20_000,
-                lock_held=True,
-            )
-            results = persistent_tx.results
-        finally:
-            try:
-                found.transport.disconnect()
-            except Exception:
-                pass
-        result = results[-1]
-        output.update(
-            {
-                "dry_run": False,
-                "transport": found.kind,
-                "endpoint": found.endpoint,
-                "request_id": str(result.get("request_id") or ""),
-                "status": str(result.get("status") or "success"),
-                "attempts": found.attempts,
-            }
-        )
+    engine = Engine(store=store, discovery=discovery, protocol_id=args.protocol)
+    if args.protocol not in engine.registry.plugins:
+        raise CliUsageError('Unknown protocol: ' + args.protocol)
+    rgb_text, rgb = parse_rgb(args.rgb)
+    validate_radio_args(args.frequency_hz, args.power_dbm)
+    zones = set()
+    for item in args.zone:
+        for zone in item.split(','):
+            zone = zone.strip().upper()
+            zones.update(engine.protocol.capabilities.zones if zone == 'ALL' else (zone,))
+    update = LogicalUpdate(tuple(sorted(zones)), rgb, args.effect)
+    radio = RadioSettings(args.frequency_hz, args.power_dbm)
+    try:
+        plan = engine.preview(update, radio)
+    except ValueError as exc:
+        raise CliUsageError(str(exc)) from exc
+    output = {'ok': True, 'protocol': engine.protocol.id, 'family': engine.protocol.display_name.split()[0],
+              'zones': sorted(zones), 'rgb': rgb_text, 'effect': args.effect,
+              'frequency_hz': args.frequency_hz, 'power_dbm': args.power_dbm, 'target_ack': False}
+    if args.dry_run:
+        output.update(dry_run=True, frames_hex=[hex_bytes(frame) for frame in plan.frames],
+                      transaction={'command': plan.commands[0][0], 'frames': len(plan.frames),
+                                   'pulse_durations': sum(len(a.get('durations_us', ())) for _, a in plan.commands),
+                                   'duration_us': sum(sum(a.get('durations_us', ())) for _, a in plan.commands)})
         return output
+    try:
+        with store.locked():
+            found = engine.connect(args.transport, lock_held=True)
+            results = engine.execute_update(update, radio, lock_held=True)
+        result = results[-1]
+        output.update(dry_run=False, transport=found.kind, endpoint=found.endpoint,
+                      request_id=str(result.get('request_id') or ''), status=str(result.get('status') or 'success'),
+                      attempts=found.attempts)
+        return output
+    finally:
+        engine.stop()
 
 
 def _error_payload(code: str, message: str, **details: Any) -> dict[str, Any]:
@@ -245,7 +231,7 @@ def _emit(payload: dict[str, Any], json_output: bool, *, error: bool = False) ->
     if payload.get("ok"):
         if payload.get("dry_run"):
             print(
-                f"D8 dry-run: zones={','.join(payload['zones'])} rgb={payload['rgb']} "
+                f"{payload['family']} dry-run: zones={','.join(payload['zones'])} rgb={payload['rgb']} "
                 f"effect={payload['effect']}",
                 file=stream,
             )

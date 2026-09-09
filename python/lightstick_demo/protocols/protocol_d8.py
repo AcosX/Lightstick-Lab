@@ -15,6 +15,9 @@ class Protocol:
         air._validate_d8_slots(slots)
         return {**state, 'slots': list(slots)}
 
+    def export_legacy(self, state):
+        return {'d8_slots': list(state['slots'])}
+
     def build_plan(self, logical, state, radio):
         slots = list(self.migrate_state(state)['slots'])
         for zone, value in logical.values:

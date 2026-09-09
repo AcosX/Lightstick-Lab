@@ -16,7 +16,7 @@ from typing import Any, Iterator
 from .protocol import D8_SLOT_COUNT, d8_word
 
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 DEFAULT_D8_SLOTS = (d8_word(15, 0, 0, 0),) + (0,) * (D8_SLOT_COUNT - 1)
 
 
@@ -40,6 +40,10 @@ def default_state() -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
         "connection": None,
+        "selected_protocol": "protocol_00",
+        "protocol_states": {},
+        "selected_connector": None,
+        "connector_configs": {},
         "d8_slots": list(DEFAULT_D8_SLOTS),
     }
 
@@ -139,7 +143,21 @@ class StateStore:
         ):
             raise StateError(f"d8_slots 必须包含 {D8_SLOT_COUNT} 个 16-bit 整数")
         state["d8_slots"] = list(slots)
+        state.update({key: raw[key] for key in ('selected_protocol', 'protocol_states', 'selected_connector', 'connector_configs') if key in raw})
+        self._migrate_plugins(state)
         return state
+
+    @staticmethod
+    def _migrate_plugins(state):
+        from .protocols.registry import ProtocolRegistry
+        if not isinstance(state['protocol_states'], dict) or not isinstance(state['connector_configs'], dict):
+            raise StateError('Plugin state/configuration must be an object')
+        registry = ProtocolRegistry()
+        for key, plugin in registry.plugins.items():
+            try:
+                state['protocol_states'][key] = plugin.migrate_state(state['protocol_states'].get(key, {}), state)
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise StateError(f'{key}: {exc}') from exc
 
     def save_unlocked(self, state: dict[str, Any]) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -153,6 +171,8 @@ class StateStore:
         ):
             raise StateError(f"d8_slots 必须包含 {D8_SLOT_COUNT} 个 16-bit 整数")
         normalized["d8_slots"] = list(slots)
+        normalized.update({key: state[key] for key in ('selected_protocol', 'protocol_states', 'selected_connector', 'connector_configs') if key in state})
+        self._migrate_plugins(normalized)
         payload = json.dumps(normalized, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         temp_path: Path | None = None
         try:
