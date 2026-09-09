@@ -13,11 +13,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .protocol import D8_SLOT_COUNT, d8_word
 
 
 STATE_VERSION = 2
-DEFAULT_D8_SLOTS = (d8_word(15, 0, 0, 0),) + (0,) * (D8_SLOT_COUNT - 1)
+def __getattr__(name):
+    if name == 'DEFAULT_D8_SLOTS':
+        from .protocols.protocol_d8 import PROTOCOL
+        return tuple(PROTOCOL.initial_state()['slots'])
+    raise AttributeError(name)
 
 
 class StateError(RuntimeError):
@@ -37,15 +40,22 @@ def default_state_dir() -> Path:
 
 
 def default_state() -> dict[str, Any]:
-    return {
+    state = {
         "version": STATE_VERSION,
         "connection": None,
         "selected_protocol": "protocol_00",
         "protocol_states": {},
         "selected_connector": None,
         "connector_configs": {},
-        "d8_slots": list(DEFAULT_D8_SLOTS),
+
     }
+    from .protocols.registry import ProtocolRegistry
+    for key, plugin in ProtocolRegistry().plugins.items():
+        state['protocol_states'][key] = plugin.initial_state()
+        export = getattr(plugin, 'export_legacy', None)
+        if export:
+            state.update(export(state['protocol_states'][key]))
+    return state
 
 
 class ProcessFileLock:
@@ -135,15 +145,10 @@ class StateStore:
             if not isinstance(connection, dict):
                 raise StateError("connection 状态格式无效")
             state["connection"] = dict(connection)
-        slots = raw.get("d8_slots", state["d8_slots"])
-        if (
-            not isinstance(slots, list)
-            or len(slots) != D8_SLOT_COUNT
-            or any(not isinstance(value, int) or not 0 <= value <= 0xFFFF for value in slots)
-        ):
-            raise StateError(f"d8_slots 必须包含 {D8_SLOT_COUNT} 个 16-bit 整数")
-        state["d8_slots"] = list(slots)
-        state.update({key: raw[key] for key in ('selected_protocol', 'protocol_states', 'selected_connector', 'connector_configs') if key in raw})
+        state.update(raw)
+        state['version'] = STATE_VERSION
+        if raw.get('version', 1) < 2:
+            state['protocol_states'] = raw.get('protocol_states', {})
         self._migrate_plugins(state)
         return state
 
@@ -152,10 +157,17 @@ class StateStore:
         from .protocols.registry import ProtocolRegistry
         if not isinstance(state['protocol_states'], dict) or not isinstance(state['connector_configs'], dict):
             raise StateError('Plugin state/configuration must be an object')
+        if not isinstance(state.get('selected_protocol'), str):
+            raise StateError('selected_protocol must be a string')
+        if state.get('selected_connector') is not None and not isinstance(state['selected_connector'], str):
+            raise StateError('selected_connector must be a string or null')
         registry = ProtocolRegistry()
         for key, plugin in registry.plugins.items():
             try:
                 state['protocol_states'][key] = plugin.migrate_state(state['protocol_states'].get(key, {}), state)
+                export = getattr(plugin, 'export_legacy', None)
+                if export:
+                    state.update(export(state['protocol_states'][key]))
             except (ValueError, TypeError, AttributeError) as exc:
                 raise StateError(f'{key}: {exc}') from exc
 
@@ -163,14 +175,8 @@ class StateStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         normalized = default_state()
         normalized["connection"] = state.get("connection")
-        slots = state.get("d8_slots")
-        if (
-            not isinstance(slots, (list, tuple))
-            or len(slots) != D8_SLOT_COUNT
-            or any(not isinstance(value, int) or not 0 <= value <= 0xFFFF for value in slots)
-        ):
-            raise StateError(f"d8_slots 必须包含 {D8_SLOT_COUNT} 个 16-bit 整数")
-        normalized["d8_slots"] = list(slots)
+        normalized.update(state)
+        normalized['version'] = STATE_VERSION
         normalized.update({key: state[key] for key in ('selected_protocol', 'protocol_states', 'selected_connector', 'connector_configs') if key in state})
         self._migrate_plugins(normalized)
         payload = json.dumps(normalized, ensure_ascii=False, indent=2, sort_keys=True) + "\n"

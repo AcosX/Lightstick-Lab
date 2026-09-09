@@ -1,0 +1,60 @@
+{
+  "name": "Lightstick-Lab OSC",
+  "version": 1,
+  "transport": "UDP",
+  "defaultPort": 9000,
+  "rgbRange": [
+    0,
+    15
+  ],
+  "effects": [
+    "solid",
+    "slow",
+    "medium",
+    "fast",
+    "off",
+    "fade_in",
+    "fade_out",
+    "hold"
+  ],
+  "messages": [
+    {
+      "address": "/lightstick/zone",
+      "types": ",siiis",
+      "arguments": [
+        "zone",
+        "R",
+        "G",
+        "B",
+        "effect"
+      ]
+    },
+    {
+      "address": "/lightstick/state",
+      "types": ",siiis",
+      "arguments": [
+        "commaSeparatedZones",
+        "R",
+        "G",
+        "B",
+        "effect"
+      ]
+    },
+    {
+      "address": "/lightstick/all",
+      "types": ",iiis",
+      "arguments": [
+        "R",
+        "G",
+        "B",
+        "effect"
+      ]
+    },
+    {
+      "address": "/lightstick/blackout",
+      "types": ",",
+      "arguments": []
+    }
+  ],
+  "bundles": "immediate timetag 1 only"
+}

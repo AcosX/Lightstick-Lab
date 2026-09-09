@@ -74,3 +74,29 @@ class SchedulerTests(unittest.TestCase):
             self.assertFalse(scheduler.submit((LogicalUpdate(('B',),(15,0,0)),)))
         finally:
             release.set(); scheduler.stop()
+
+class FailureConcurrencyTests(unittest.TestCase):
+    def test_uncertain_tx_discards_pending_and_requires_recovery(self):
+        from lightstick_demo.controller import TxOutcomeUncertainError
+        started=threading.Event(); release=threading.Event(); calls=[]
+        def execute(state):
+            calls.append(state); started.set(); release.wait(2)
+            raise TxOutcomeUncertainError('lost completion')
+        scheduler=Scheduler(execute); scheduler.start()
+        try:
+            scheduler.submit((LogicalUpdate(('A',),(1,0,0)),)); self.assertTrue(started.wait(2))
+            scheduler.submit((LogicalUpdate(('A',),(2,0,0)),)); release.set()
+            self.assertTrue(scheduler.wait_idle(2)); self.assertEqual(len(calls),1)
+            self.assertTrue(scheduler.status()['suspended'])
+            with self.assertRaises(RuntimeError): scheduler.submit((LogicalUpdate(('A',),(3,0,0)),))
+        finally: release.set(); scheduler.stop()
+    def test_return_to_running_state_cancels_intermediate_pending(self):
+        started=threading.Event(); release=threading.Event(); calls=[]
+        def execute(state): calls.append(state); started.set(); release.wait(2)
+        scheduler=Scheduler(execute); scheduler.start()
+        try:
+            first=LogicalUpdate(('A',),(1,0,0))
+            scheduler.submit((first,)); self.assertTrue(started.wait(2))
+            scheduler.submit((LogicalUpdate(('A',),(2,0,0)),)); scheduler.submit((first,))
+            release.set(); self.assertTrue(scheduler.wait_idle(2)); self.assertEqual(len(calls),1)
+        finally: release.set(); scheduler.stop()

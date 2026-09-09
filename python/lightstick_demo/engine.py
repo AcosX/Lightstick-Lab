@@ -1,7 +1,7 @@
 """Shared lifecycle and transactional execution for GUI, CLI and connectors."""
 import threading
 from contextlib import nullcontext
-from .controller import Controller
+from .controller import Controller, TxOutcomeUncertainError
 from .discovery import AutoDiscovery, validate_bridge_info
 from .model import LogicalState, LogicalUpdate, RadioSettings
 from .protocols.registry import ProtocolRegistry
@@ -17,6 +17,8 @@ class Engine:
         state = self.store.load_unlocked()
         self.protocol = self.registry.resolve(protocol_id or state['selected_protocol'])
         self.warning = '' if (protocol_id or state['selected_protocol']) in self.registry.plugins else 'Selected protocol unavailable; using ' + self.protocol.display_name
+        if self.registry.errors:
+            self.warning += " Plugin errors: " + str(self.registry.errors)
         self.transport = None
         self.connection = None
         self.radio = RadioSettings()
@@ -24,14 +26,19 @@ class Engine:
         self._input_lock = threading.RLock()
         self.scheduler = Scheduler(self._execute_logical)
         self._accepting = True
+        self._closed = False
 
     def start(self):
         with self._input_lock:
+            if self._closed:
+                raise RuntimeError('Engine closed')
             self._accepting = True
             self.scheduler.start()
 
     def connect(self, requested='auto', *, lock_held=False):
         with self._tx_lock:
+            if self._closed:
+                raise RuntimeError('Engine closed')
             if self.transport is not None:
                 return self.connection
             with nullcontext(self.store) if lock_held else self.store.locked():
@@ -43,12 +50,17 @@ class Engine:
                 except Exception:
                     found.transport.disconnect()
                     raise
+                self.scheduler.reset()
+                self._accepting = True
                 self.transport, self.connection = found.transport, found
                 return found
 
     def attach(self, transport):
         with self._tx_lock:
+            if self._closed:
+                raise RuntimeError('Engine closed')
             validate_bridge_info(transport.request('GET_INFO', {}))
+            self.scheduler.reset()
             old = self.transport
             self.transport = transport
             if old is not None and old is not transport:
@@ -73,6 +85,10 @@ class Engine:
         with self._input_lock:
             if not self._accepting:
                 raise RuntimeError('Engine stopped')
+            updates = tuple(LogicalUpdate(tuple(z for z in u.zones if z in self.protocol.capabilities.zones), u.rgb, u.effect, u.palette)
+                            if u.rgb == (0,0,0) and u.effect in ('solid','off') else u
+                            for u in updates
+                            if not (u.rgb == (0,0,0) and u.effect in ('solid','off') and not set(u.zones).intersection(self.protocol.capabilities.zones)))
             try:
                 self._validate(updates)
             except ValueError as exc:
@@ -91,6 +107,9 @@ class Engine:
     def execute_update(self, updates, radio=None, *, lock_held=False):
         updates = (updates,) if isinstance(updates, LogicalUpdate) else tuple(updates)
         with self._input_lock:
+            if self.scheduler.status()['running'] or self.scheduler.status()['pending']:
+                raise RuntimeError('Scheduled TX active; use submit_update')
+            self.scheduler.reset()
             self._validate(updates)
             return self._execute_logical(LogicalState().apply(updates), radio, lock_held=lock_held)
 
@@ -109,17 +128,25 @@ class Engine:
                 export = getattr(self.protocol, 'export_legacy', None)
                 if export:
                     state.update(export(plan.next_state))
-                self.store.save_unlocked(state)
+                try:
+                    self.store.save_unlocked(state)
+                except Exception as exc:
+                    raise TxOutcomeUncertainError('TX completed but state commit failed; reconnect after repairing state: ' + str(exc)) from exc
                 return results
 
     def execute_commands(self, commands):
+        with self._input_lock:
+            self.scheduler.reset()
+            return self._execute_commands(commands)
+
+    def _execute_commands(self, commands):
         with self._tx_lock, self.store.locked():
             if self.transport is None:
                 raise TransportError('Bridge is not connected')
             return Controller(self.transport).execute_commands(commands)
 
     def status(self):
-        return {'connected': self.transport is not None, 'protocol': self.protocol.id,
+        return {'connected': self.transport is not None, 'protocol': self.protocol.id, 'zones': self.protocol.capabilities.zones,
                 'warning': self.warning, 'tx': self.scheduler.status()}
 
     def disconnect(self):
@@ -133,4 +160,6 @@ class Engine:
                 transport.disconnect()
 
     def stop(self):
+        with self._input_lock:
+            self._closed = True
         self.disconnect()
