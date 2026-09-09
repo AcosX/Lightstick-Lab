@@ -115,3 +115,29 @@ class CommitFailureTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): self.engine.execute_update(LogicalUpdate(('B',),(2,3,4)))
         with self.assertRaises(RuntimeError): self.engine.select_protocol('protocol_00')
         self.assertEqual(sum(c[0]=='TX_PULSES' for c in self.engine.transport.calls),1)
+
+class ReconnectTests(unittest.TestCase):
+    def test_reconnect_drains_running_and_discards_pending_before_replacing_transport(self):
+        started=threading.Event(); release=threading.Event()
+        class BlockingTransport(FakeTransport):
+            def request(self, command, args=None, timeout=8):
+                if command == 'GET_TX_RESULT': started.set(); release.wait(2)
+                return super().request(command,args,timeout)
+        with tempfile.TemporaryDirectory() as directory:
+            engine=Engine(StateStore(Path(directory)),protocol_id='protocol_d8')
+            old=BlockingTransport('old'); new=FakeTransport('new'); engine.transport=old
+            engine.submit_update(LogicalUpdate(('A',),(1,2,3)))
+            self.assertTrue(started.wait(2))
+            engine.submit_update(LogicalUpdate(('B',),(4,5,6)))
+            errors=[]
+            def reconnect():
+                try: engine.attach(new)
+                except Exception as exc: errors.append(exc)
+            worker=threading.Thread(target=reconnect); worker.start()
+            with engine.scheduler._condition:
+                self.assertTrue(engine.scheduler._condition.wait_for(lambda: engine.scheduler._stopping, 2))
+            release.set(); worker.join(3)
+            self.assertFalse(worker.is_alive()); self.assertEqual(errors,[])
+            self.assertIs(engine.transport,new); self.assertTrue(old.disconnected)
+            self.assertEqual(sum(c[0]=='TX_PULSES' for c in old.calls),1)
+            engine.stop()

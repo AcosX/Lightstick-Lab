@@ -97,4 +97,4 @@ Baseline: 82 existing Python tests passed before edits. New tests cover plugin d
 
 [Benchmark results](benchmark.json) contain 20 UDP-to-fake-Bridge scenarios: both connectors at 1/2/5/6/10 Hz, changing and repeated states, using a 785.75 ms simulated TX completion delay. All cases kept pending at 0–1 with no failed TX; repeated states transmitted once. These short runs demonstrate bounded scheduling, not long-duration hardware latency or reliability. USB/Wi-Fi/BLE hardware, physical stick behavior, live LumaFlow/CuePilot software and shorter D8 phases have not been tested in this migration.
 
-Final local regression: **103 tests passed**, plus D8 and 00 CLI dry runs. Cross-platform CI is configured for Python 3.11/3.12 on Linux, macOS and Windows. Screenshot-based visual inspection was not performed.
+Final local regression: **104 tests passed**, plus D8 and 00 CLI dry runs. Cross-platform CI is configured for Python 3.11/3.12 on Linux, macOS and Windows. Screenshot-based visual inspection was not performed.

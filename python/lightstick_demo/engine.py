@@ -36,6 +36,11 @@ class Engine:
             self.scheduler.start()
 
     def connect(self, requested='auto', *, lock_held=False):
+        with self._input_lock:
+            self.scheduler.stop()
+            return self._connect(requested, lock_held=lock_held)
+
+    def _connect(self, requested='auto', *, lock_held=False):
         with self._tx_lock:
             if self._closed:
                 raise RuntimeError('Engine closed')
@@ -56,6 +61,11 @@ class Engine:
                 return found
 
     def attach(self, transport):
+        with self._input_lock:
+            self.scheduler.stop()
+            return self._attach(transport)
+
+    def _attach(self, transport):
         with self._tx_lock:
             if self._closed:
                 raise RuntimeError('Engine closed')
