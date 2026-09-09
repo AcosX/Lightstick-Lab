@@ -45,6 +45,12 @@ class LumaFlow(UdpConnector):
     display_name = 'LumaFlow UDP'
     default_config = {'host':'0.0.0.0', 'port':32712}
     config_schema = {'host':'string', 'port':'integer'}
-    parse = staticmethod(parse_packet)
+    def parse(self, packet):
+        # Repeated STREAM datagrams reuse the parsed immutable updates. Still
+        # submit them: core dedupe knows about manual changes and TX failures.
+        if packet != getattr(self, '_last_packet', None):
+            updates = parse_packet(packet)
+            self._last_packet, self._last_updates = packet, updates
+        return self._last_updates
 
 CONNECTOR = LumaFlow()

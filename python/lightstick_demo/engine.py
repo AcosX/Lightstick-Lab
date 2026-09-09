@@ -50,7 +50,7 @@ class Engine:
                 except Exception:
                     found.transport.disconnect()
                     raise
-                self.scheduler.reset()
+                self.scheduler.reset(recover=True)
                 self._accepting = True
                 self.transport, self.connection = found.transport, found
                 return found
@@ -60,7 +60,7 @@ class Engine:
             if self._closed:
                 raise RuntimeError('Engine closed')
             validate_bridge_info(transport.request('GET_INFO', {}))
-            self.scheduler.reset()
+            self.scheduler.reset(recover=True)
             old = self.transport
             self.transport = transport
             if old is not None and old is not transport:
@@ -121,7 +121,11 @@ class Engine:
                 state = self.store.load_unlocked()
                 plugin_state = state['protocol_states'].get(self.protocol.id, self.protocol.initial_state())
                 plan = self.protocol.build_plan(logical, plugin_state, radio or self.radio)
-                results = Controller(self.transport).execute_commands(plan.commands)
+                try:
+                    results = Controller(self.transport).execute_commands(plan.commands)
+                except TxOutcomeUncertainError as exc:
+                    self.scheduler.suspend(exc)
+                    raise
                 state['protocol_states'][self.protocol.id] = plan.next_state
                 state['selected_protocol'] = self.protocol.id
                 # Compatibility state exports are owned by plugins.
@@ -131,7 +135,9 @@ class Engine:
                 try:
                     self.store.save_unlocked(state)
                 except Exception as exc:
-                    raise TxOutcomeUncertainError('TX completed but state commit failed; reconnect after repairing state: ' + str(exc)) from exc
+                    error = TxOutcomeUncertainError('TX completed but state commit failed; reconnect after repairing state: ' + str(exc))
+                    self.scheduler.suspend(error)
+                    raise error from exc
                 return results
 
     def execute_commands(self, commands):

@@ -58,12 +58,21 @@ class Scheduler:
                     'pending': int(self._pending is not None), 'error': self.last_error,
                     'suspended': self._suspended, 'queue_ms': self.last_queue_ms, 'tx_ms': self.last_tx_ms}
 
-    def reset(self):
+    def reset(self, *, recover=False):
         with self._condition:
+            if self._suspended and not recover:
+                raise RuntimeError('TX outcome uncertain; reconnect before sending again')
             if self._running is not None or self._pending is not None:
                 raise RuntimeError('Cannot switch protocol while TX is pending')
             self._desired = self._confirmed = LogicalState()
             self._suspended = False
+
+    def suspend(self, error):
+        with self._condition:
+            self._suspended = True
+            self._pending = None
+            self.last_error = str(error)
+            self._condition.notify_all()
 
     def wait_idle(self, timeout=45):
         end = time.monotonic() + timeout

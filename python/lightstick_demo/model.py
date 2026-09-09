@@ -10,6 +10,7 @@ class ZoneState:
     palette: int | None = None
 
     def __post_init__(self):
+        object.__setattr__(self, "rgb", tuple(self.rgb))
         if len(self.rgb) != 3 or any(type(v) is not int or not 0 <= v <= 15 for v in self.rgb):
             raise ValueError('RGB channels must be integers in 0..15')
         if not isinstance(self.effect, str) or not self.effect:
@@ -23,6 +24,8 @@ class LogicalUpdate:
     palette: int | None = None
 
     def __post_init__(self):
+        object.__setattr__(self, "zones", tuple(self.zones))
+        object.__setattr__(self, "rgb", tuple(self.rgb))
         if not self.zones or any(not isinstance(z, str) or not z for z in self.zones):
             raise ValueError('At least one named zone is required')
         ZoneState(self.rgb, self.effect, self.palette)

@@ -100,3 +100,18 @@ class FailureConcurrencyTests(unittest.TestCase):
             scheduler.submit((LogicalUpdate(('A',),(2,0,0)),)); scheduler.submit((first,))
             release.set(); self.assertTrue(scheduler.wait_idle(2)); self.assertEqual(len(calls),1)
         finally: release.set(); scheduler.stop()
+
+class CommitFailureTests(unittest.TestCase):
+    setUp = EngineTests.setUp
+    tearDown = EngineTests.tearDown
+    def test_commit_failure_suspends_without_retry(self):
+        from unittest.mock import patch
+        from lightstick_demo.state import StateError
+        from lightstick_demo.controller import TxOutcomeUncertainError
+        with patch.object(self.store, 'save_unlocked', side_effect=StateError('disk full')):
+            with self.assertRaises(TxOutcomeUncertainError):
+                self.engine.execute_update(LogicalUpdate(('B',),(2,3,4)))
+        self.assertTrue(self.engine.status()['tx']['suspended'])
+        with self.assertRaises(RuntimeError): self.engine.execute_update(LogicalUpdate(('B',),(2,3,4)))
+        with self.assertRaises(RuntimeError): self.engine.select_protocol('protocol_00')
+        self.assertEqual(sum(c[0]=='TX_PULSES' for c in self.engine.transport.calls),1)

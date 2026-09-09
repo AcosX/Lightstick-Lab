@@ -334,7 +334,7 @@ class LightstickApp(LegacyControls, tk.Tk):
         self.zone_buttons.append(all_button)
         for index, (zone, variable) in enumerate(self.zone_vars.items(), start=2):
             button = ttk.Checkbutton(zones, text=zone, variable=variable, command=self._zone_changed)
-            button.grid(row=0, column=index, sticky="w", padx=1)
+            button.grid(row=index // 10, column=index % 10, sticky="w", padx=1)
             self.zone_buttons.append(button)
 
         body = ttk.Frame(tab)
@@ -358,18 +358,18 @@ class LightstickApp(LegacyControls, tk.Tk):
             )
             button.grid(row=index // 2, column=index % 2, sticky="ew", padx=3, pady=3)
             self.function_buttons[state] = button
-        ttk.Separator(functions, orient="horizontal").grid(row=4, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Separator(functions, orient="horizontal").grid(row=(len(states)+1)//2, column=0, columnspan=2, sticky="ew", pady=4)
         ttk.Button(
             functions,
             text="所有分区变色",
             style="Small.TButton",
             command=self.open_c0_dialog,
-        ).grid(row=5, column=0, columnspan=2, sticky="ew", padx=3, pady=3)
+        ).grid(row=(len(states)+1)//2+1, column=0, columnspan=2, sticky="ew", padx=3, pady=3)
         ttk.Button(functions, text="脉冲", style="Small.TButton", command=self._send_a6).grid(
-            row=6, column=1, sticky="ew", padx=3, pady=3
+            row=(len(states)+1)//2+2, column=1, sticky="ew", padx=3, pady=3
         )
         ttk.Button(functions, text="解锁", style="Small.TButton", command=self._send_da).grid(
-            row=6, column=0, sticky="ew", padx=3, pady=3
+            row=(len(states)+1)//2+2, column=0, sticky="ew", padx=3, pady=3
         )
 
         colors = ttk.LabelFrame(body, text="颜色", padding=(9, 7))

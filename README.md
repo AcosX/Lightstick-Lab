@@ -166,3 +166,9 @@ ESP32 三种传输共用的请求、响应、录制与 Profile 接口见 [docs/r
 本项目以 [GNU General Public License v3.0](LICENSE) 发布（SPDX: `GPL-3.0-only`）。
 
 [![License: GPL-3.0-only](https://img.shields.io/badge/License-GPL--3.0--only-blue.svg)](LICENSE)
+
+## 协议插件与外部控制
+
+Python 客户端支持自动发现 `protocols/` 协议插件和 `server/` 外部输入插件。GUI、CLI 与外部控制共享 Engine；实时输入采用单 RF TX、状态去重和最多一个 latest-state pending。内置 **00 短命令**、**D8 RGB**、**LumaFlow UDP** 和 **CuePilot OSC**。
+
+[插件接口、状态迁移与验证说明](docs/architecture/plugins.md) · [OSC Schema JSON](docs/lightstick-osc-schema.json)
