@@ -24,7 +24,7 @@ A scheduler worker owns one running state and at most one latest pending state. 
 
 `received`, `deduplicated`, `coalesced`, `unsupported`, `transmitted`, `failed`, pending depth, queue delay and TX duration are observable. Connector counters separately report packets, malformed input and deduplication. LumaFlow caches one parsed packet and still consults core dedupe so manual changes and failed transmissions are respected.
 
-An uncertain submission/result or failed state commit suspends scheduling and drops pending input. Reconnect before resuming; no automatic waveform retransmission is attempted. A protocol change while running/pending is rejected rather than applying a queued update through the wrong protocol. Ordinary explicit CLI commands are synchronous Engine transactions; GUI and network updates use its scheduler.
+An uncertain submission/result or failed state commit suspends scheduling and drops pending input. Reconnect before resuming; no automatic waveform retransmission is attempted. A protocol change while running/pending is rejected rather than applying a queued update through the wrong protocol. Explicit CLI and manual GUI commands are Engine transactions; GUI runs them in a background worker. Each completed manual click can transmit again, including repeated identical states and changed radio settings. Network streams alone use state deduplication. A manual transaction drains running RF and supersedes pending stream state before executing; later network input resumes scheduling.
 
 ## Protocol plugin contract
 
@@ -98,3 +98,10 @@ Baseline: 82 existing Python tests passed before edits. New tests cover plugin d
 [Benchmark results](benchmark.json) contain 20 UDP-to-fake-Bridge scenarios: both connectors at 1/2/5/6/10 Hz, changing and repeated states, using a 785.75 ms simulated TX completion delay. All cases kept pending at 0–1 with no failed TX; repeated states transmitted once. These short runs demonstrate bounded scheduling, not long-duration hardware latency or reliability. USB/Wi-Fi/BLE hardware, physical stick behavior, live LumaFlow/CuePilot software and shorter D8 phases have not been tested in this migration.
 
 Final local regression: **104 tests passed**, plus D8 and 00 CLI dry runs. Cross-platform CI is configured for Python 3.11/3.12 on Linux, macOS and Windows. Screenshot-based visual inspection was not performed.
+
+
+## GUI interaction regression follow-up
+
+Fixed an idle polling bug that added a new self-rescheduling status loop on every worker poll. The GUI now owns exactly one worker timer and one status timer, and cancels both on close. Manual sends preserve the old explicit-action behavior instead of being deduplicated as stream state. Hidden RGB input cannot block palette commands or blackout. Disconnect updates the displayed connection state, result callback errors do not stop future worker processing, and connector start/stop runs in a worker; stopping does not depend on valid TX settings.
+
+Interaction tests exercise actual Tk command bindings against fake transports: repeated manual sends and changed power, 00 effects and colors, D8 blackout, pulse/unlock/C0, Profile CRUD/TX, raw commands, recording, Wi-Fi configuration, USB/BLE/HTTP connection entry points, disconnect, external start/stop, timer bounds, and callback recovery. Physical radio/target behavior remains outside this simulated validation.

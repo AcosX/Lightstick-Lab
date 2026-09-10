@@ -76,8 +76,10 @@ class Engine:
             if old is not None and old is not transport:
                 old.disconnect()
 
-    def select_protocol(self, protocol_id):
-        with self._input_lock:
+    def select_protocol(self, protocol_id, *, blocking=True):
+        if not self._input_lock.acquire(blocking=blocking):
+            raise RuntimeError('正在连接或发射，请完成后再切换协议')
+        try:
             plugin = self.registry.plugins[protocol_id]
             self.scheduler.reset()
             with self._tx_lock, self.store.locked():
@@ -85,6 +87,8 @@ class Engine:
                 state['selected_protocol'] = protocol_id
                 self.store.save_unlocked(state)
                 self.protocol = plugin
+        finally:
+            self._input_lock.release()
 
     def _validate(self, updates):
         for update in updates:
@@ -117,10 +121,13 @@ class Engine:
     def execute_update(self, updates, radio=None, *, lock_held=False):
         updates = (updates,) if isinstance(updates, LogicalUpdate) else tuple(updates)
         with self._input_lock:
-            if self.scheduler.status()['running'] or self.scheduler.status()['pending']:
-                raise RuntimeError('Scheduled TX active; use submit_update')
-            self.scheduler.reset()
+            if self._closed or not self._accepting:
+                raise RuntimeError('Engine stopped')
             self._validate(updates)
+            # Explicit manual/CLI commands are actions, not deduplicated stream
+            # state. Drain running RF, supersede pending input and rebase once.
+            self.scheduler.stop()
+            self.scheduler.reset()
             return self._execute_logical(LogicalState().apply(updates), radio, lock_held=lock_held)
 
     def _execute_logical(self, logical, radio=None, *, lock_held=False):
@@ -152,6 +159,7 @@ class Engine:
 
     def execute_commands(self, commands):
         with self._input_lock:
+            self.scheduler.stop()
             self.scheduler.reset()
             return self._execute_commands(commands)
 
@@ -159,7 +167,11 @@ class Engine:
         with self._tx_lock, self.store.locked():
             if self.transport is None:
                 raise TransportError('Bridge is not connected')
-            return Controller(self.transport).execute_commands(commands)
+            try:
+                return Controller(self.transport).execute_commands(commands)
+            except TxOutcomeUncertainError as exc:
+                self.scheduler.suspend(exc)
+                raise
 
     def status(self):
         return {'connected': self.transport is not None, 'protocol': self.protocol.id, 'zones': self.protocol.capabilities.zones,

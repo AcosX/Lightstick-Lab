@@ -1,5 +1,6 @@
 """Real Tk layout regression; skipped only when no display is available."""
 import tempfile
+import time
 import tkinter as tk
 import unittest
 from pathlib import Path
@@ -65,7 +66,11 @@ class LayoutTests(unittest.TestCase):
             for label, button in app.function_buttons.items():
                 if button.instate(['!disabled']):
                     app._send_state(label)
-                    self.assertTrue(app.engine.scheduler.wait_idle(2))
+                    deadline = time.monotonic() + 2
+                    while app._busy_tasks and time.monotonic() < deadline:
+                        app.update()
+                        time.sleep(.005)
+                    self.assertFalse(app._busy_tasks)
                     self.assertFalse(app.engine.status()['tx']['error'])
         self.assertEqual(errors, [])
         self.assertTrue(any(command == 'TX_PULSES' for command, _, _ in fake.calls))

@@ -200,8 +200,8 @@ class LightstickApp(LegacyControls, tk.Tk):
         self._build_style()
         self._build_header()
         self._build_tabs()
-        self.after(80, self._poll_worker_events)
-        self.after(200, self._refresh_engine_status)
+        self._worker_after_id = self.after(80, self._poll_worker_events)
+        self._status_after_id = self.after(200, self._refresh_engine_status)
 
     def _stop_connector(self):
         self.connector_var.set('关闭')
@@ -209,15 +209,21 @@ class LightstickApp(LegacyControls, tk.Tk):
 
     def _switch_connector(self):
         key = self._connector_names[self.connector_var.get()]
-        config = self._state_store.load_unlocked()['connector_configs'].get(key, {})
-        frequency, repeat, gap, power = self._tx_settings()
-        self.engine.radio = RadioSettings(frequency, power, repeat, gap)
-        self._submit('connector-switch', lambda: self.server_manager.switch(key, config), '外部控制已切换')
+        try:
+            config = self._state_store.load_unlocked()['connector_configs'].get(key, {})
+            if key is not None:
+                frequency, repeat, gap, power = self._tx_settings()
+                self.engine.radio = RadioSettings(frequency, power, repeat, gap)
+        except Exception as exc:
+            self._show_error('外部控制参数无效', str(exc))
+            return
+        if not self._submit('connector-switch', lambda: self.server_manager.switch(key, config), '外部控制已切换'):
+            self.external_status_var.set('正在切换，请等待当前操作完成')
 
     def _configure_connector(self):
         key = self._connector_names[self.connector_var.get()]
         if key is None:
-            self.server_manager.switch(None)
+            self._switch_connector()
             return
         plugin = self.server_manager.registry.plugins[key]
         saved = self._state_store.load_unlocked()['connector_configs'].get(key, {})
@@ -231,11 +237,19 @@ class LightstickApp(LegacyControls, tk.Tk):
         def start():
             try:
                 settings = {name: int(var.get()) if plugin.config_schema[name] == 'integer' else var.get() for name,var in entries.items()}
-                self.server_manager.switch(key, settings)
+                frequency, repeat, gap, power = self._tx_settings()
+                radio = RadioSettings(frequency, power, repeat, gap)
             except Exception as exc:
                 self._show_error('外部控制启动失败', str(exc))
                 return
-            dialog.destroy()
+            def operation():
+                self.engine.radio = radio
+                self.server_manager.switch(key, settings)
+            def done(_):
+                if dialog.winfo_exists():
+                    dialog.destroy()
+            if not self._submit('connector-switch', operation, '外部控制已启动', done):
+                self.external_status_var.set('正在切换，请等待当前操作完成')
         ttk.Button(dialog, text='启动', command=start).grid(row=len(entries), column=1, pady=10)
 
     def _refresh_engine_status(self):
@@ -251,9 +265,10 @@ class LightstickApp(LegacyControls, tk.Tk):
             summary = '准备就绪'
         # Keep manual operation results/errors until the scheduler state changes.
         signature = (tx['running'], tx['pending'], tx['transmitted'], tx['failed'], tx['error'])
-        if signature != getattr(self, '_last_tx_signature', None):
+        previous = getattr(self, '_last_tx_signature', None)
+        if previous is not None and signature != previous and 'air-tx' not in self._busy_tasks:
             self.air_activity_var.set(summary)
-            self._last_tx_signature = signature
+        self._last_tx_signature = signature
         external = self.server_manager.status()
         active = '正在监听' if external.get('active') else '未启动'
         address = external.get('address')
@@ -265,7 +280,7 @@ class LightstickApp(LegacyControls, tk.Tk):
             f"接收更新：{tx['received']}    去重：{tx['deduplicated']}    合并：{tx['coalesced']}\n"
             f"发射完成：{tx['transmitted']}    失败：{tx['failed']}    不支持：{tx['unsupported']}\n"
             f"网络收包：{external.get('received',0)}    无效包：{external.get('malformed',0)}")
-        self.after(200, self._refresh_engine_status)
+        self._status_after_id = self.after(200, self._refresh_engine_status)
 
     def _build_style(self) -> None:
         style = ttk.Style(self)
@@ -333,7 +348,9 @@ class LightstickApp(LegacyControls, tk.Tk):
         self._readonly_entry(preview, self.preview_var, 1).grid(row=0, column=1, sticky="ew")
 
         self._effect_labels = {'off':'熄灭','solid':'常亮','slow':'慢闪','medium':'中闪','fast':'快闪','hold':'保持','fade_in':'Fade in','fade_out':'Fade out'}
-        self._effect_ids = {self._effect_labels.get(effect,effect):effect for plugin in self.engine.registry.plugins.values() for effect in plugin.capabilities.effects}
+        effects = tuple(dict.fromkeys(effect for plugin in self.engine.registry.plugins.values() for effect in plugin.capabilities.effects))
+        self._effect_ids = {label:effect for effect,label in self._effect_labels.items() if effect in effects}
+        self._effect_ids.update({effect:effect for effect in effects if effect not in self._effect_labels})
         self._protocol_names = {plugin.display_name: key for key, plugin in self.engine.registry.plugins.items()}
         self.air_family_var = tk.StringVar(value=self.engine.protocol.display_name)
         family = ttk.Frame(tab)
@@ -345,6 +362,9 @@ class LightstickApp(LegacyControls, tk.Tk):
         self.rgb_hex_entry = ttk.Entry(family, textvariable=self.rgb_hex_var, width=12)
         self.rgb_hex_label.grid(row=0, column=3, sticky="e", padx=(26, 4))
         self.rgb_hex_entry.grid(row=0, column=4, sticky="w")
+        self.capabilities_var = tk.StringVar(value='')
+        self.capabilities_label = ttk.Label(family, textvariable=self.capabilities_var, style='Muted.TLabel', wraplength=650)
+        self.capabilities_label.grid(row=1, column=0, columnspan=5, sticky='w', pady=(4,0))
 
         zones = ttk.Frame(tab)
         zones.grid(row=2, column=0, sticky="ew", pady=(0, 7))
@@ -491,7 +511,7 @@ class LightstickApp(LegacyControls, tk.Tk):
             return
         selected = self._protocol_names[self.air_family_var.get()]
         try:
-            self.engine.select_protocol(selected)
+            self.engine.select_protocol(selected, blocking=False)
         except Exception as exc:
             self.air_activity_var.set(str(exc))
             self._reverting_protocol = True
@@ -508,6 +528,9 @@ class LightstickApp(LegacyControls, tk.Tk):
         effects = self._effect_ids
         for label, button in self.function_buttons.items():
             button.state(['!disabled'] if effects[label] in caps.effects else ['disabled'])
+        unsupported = [label for label,effect in effects.items() if effect not in caps.effects]
+        self.capabilities_var.set('当前协议不支持：' + '、'.join(unsupported) if unsupported else '')
+        self.capabilities_label.grid() if unsupported else self.capabilities_label.grid_remove()
         if effects[self.command_state_var.get()] not in caps.effects:
             self.command_state_var.set(next(label for label,effect in effects.items() if effect in caps.effects))
         for button in self.color_buttons:
@@ -534,10 +557,17 @@ class LightstickApp(LegacyControls, tk.Tk):
         return [zone for zone, variable in self.zone_vars.items() if variable.get()]
 
     def _current_update(self):
-        effects = self._effect_ids
-        rgb = rgb_from_hex(self.rgb_hex_var.get())
-        palette = self.color_var.get() if self.engine.protocol.capabilities.color_mode == 'palette' else None
-        return LogicalUpdate(tuple(self._selected_zones()), rgb, effects[self.command_state_var.get()], palette)
+        effect = self._effect_ids[self.command_state_var.get()]
+        caps = self.engine.protocol.capabilities
+        palette = self.color_var.get() if caps.color_mode == 'palette' else None
+        if palette is not None:
+            colors = {code:color for code,_,color in caps.palette}
+            rgb = rgb_from_hex(colors.get(palette) or palette_hex(palette))
+        elif effect == 'off':
+            rgb = (0, 0, 0)
+        else:
+            rgb = rgb_from_hex(self.rgb_hex_var.get())
+        return LogicalUpdate(tuple(self._selected_zones()), rgb, effect, palette)
 
     def _current_frames(self):
         return self.engine.preview(self._current_update()).frames
@@ -573,18 +603,26 @@ class LightstickApp(LegacyControls, tk.Tk):
     def _start_air_tx(self, frames=None):
         if self._connected_transport('无法发射') is None:
             return
+        if 'air-tx' in self._busy_tasks:
+            self.air_activity_var.set('正在发射，请等待本次完成')
+            return
         try:
             frequency, repeat, gap, power = self._tx_settings()
-            self.engine.radio = RadioSettings(frequency, power, repeat, gap)
+            radio = RadioSettings(frequency, power, repeat, gap)
             if frames is None:
-                self.engine.submit_update(self._current_update())
-                return
-            commands = [('TX_PULSES', tx_pulses_args(encode_air_pulses(frame), frequency, power, repeat, gap)) for frame in frames]
+                update = self._current_update()
+                self.engine.preview(update, radio)
+                operation = lambda: self.engine.execute_update(update, radio)
+            else:
+                commands = [('TX_PULSES', tx_pulses_args(encode_air_pulses(frame), frequency, power, repeat, gap)) for frame in frames]
+                operation = lambda: self.engine.execute_commands(commands)
         except Exception as exc:
             self._show_error('发射参数无效', str(exc))
             return
-        self._submit('air-tx', lambda: self.engine.execute_commands(commands), '发射完成',
-                     lambda value: self.air_activity_var.set('Bridge TX 完成；无目标 ACK'))
+        self.air_activity_var.set('正在发射并等待 TX 结果')
+        self._submit('air-tx', operation, '发射完成',
+                     lambda value: self.air_activity_var.set('Bridge 发射完成；无目标 ACK'),
+                     lambda detail: self.air_activity_var.set('发射失败：' + detail))
 
     def _build_esp_tab(self) -> None:
         tab = self.esp_tab
@@ -723,8 +761,7 @@ class LightstickApp(LegacyControls, tk.Tk):
             return
 
         def finished(status: Any) -> None:
-            if isinstance(status, TransportStatus):
-                self._update_transport_status(status)
+            self._update_transport_status(TransportStatus(self.transport_status.kind, False, "已断开"))
             self.transport = None
 
         self._submit("disconnect", self.engine.disconnect, "已断开", finished)
@@ -1188,11 +1225,13 @@ class LightstickApp(LegacyControls, tk.Tk):
             if event.task in {"recording", "record-recovery"}:
                 self._finish_recording(event.value)
             if callback:
-                callback(event.value)
+                try:
+                    callback(event.value)
+                except Exception as exc:
+                    self._show_error('操作结果处理失败', str(exc))
             if message:
                 self.esp_activity_var.set(message)
-        self.after(80, self._poll_worker_events)
-        self.after(200, self._refresh_engine_status)
+        self._worker_after_id = self.after(80, self._poll_worker_events)
 
     def _handle_progress(self, event: WorkerEvent) -> None:
         if event.task not in {"recording", "record-recovery"} or not isinstance(event.value, dict):
@@ -1228,6 +1267,11 @@ class LightstickApp(LegacyControls, tk.Tk):
             pass
 
     def _close(self):
+        for name in ('_worker_after_id', '_status_after_id'):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                self.after_cancel(timer)
+                setattr(self, name, None)
         self.server_manager.close()
         self.engine.stop()
         self.transport = None

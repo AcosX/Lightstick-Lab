@@ -141,3 +141,32 @@ class ReconnectTests(unittest.TestCase):
             self.assertIs(engine.transport,new); self.assertTrue(old.disconnected)
             self.assertEqual(sum(c[0]=='TX_PULSES' for c in old.calls),1)
             engine.stop()
+
+class ManualStreamTests(unittest.TestCase):
+    def test_explicit_action_waits_for_stream_then_transmits_and_stream_resumes(self):
+        from test_cli_control import FakeTransport
+        started=threading.Event(); release=threading.Event(); errors=[]
+        class Blocking(FakeTransport):
+            def request(self, command, args=None, timeout=8):
+                if command=='GET_TX_RESULT' and not release.is_set():
+                    started.set(); release.wait(3)
+                return super().request(command,args,timeout)
+        with tempfile.TemporaryDirectory() as directory:
+            engine=Engine(StateStore(Path(directory)),protocol_id='protocol_d8')
+            transport=Blocking('test'); engine.transport=transport
+            engine.submit_update(LogicalUpdate(('A',),(1,0,0)))
+            self.assertTrue(started.wait(2))
+            engine.submit_update(LogicalUpdate(('A',),(2,0,0)))
+            def manual():
+                try: engine.execute_update(LogicalUpdate(('B',),(0,15,0)))
+                except Exception as exc: errors.append(exc)
+            worker=threading.Thread(target=manual); worker.start()
+            with engine.scheduler._condition:
+                self.assertTrue(engine.scheduler._condition.wait_for(lambda:engine.scheduler._stopping,2))
+            release.set(); worker.join(3)
+            self.assertFalse(worker.is_alive()); self.assertEqual(errors,[])
+            self.assertEqual(sum(c[0]=='TX_PULSES' for c in transport.calls),2)
+            engine.submit_update(LogicalUpdate(('C',),(0,0,15)))
+            self.assertTrue(engine.scheduler.wait_idle(2))
+            self.assertEqual(sum(c[0]=='TX_PULSES' for c in transport.calls),3)
+            engine.stop()

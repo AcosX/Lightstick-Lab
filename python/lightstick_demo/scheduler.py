@@ -66,6 +66,7 @@ class Scheduler:
                 raise RuntimeError('Cannot switch protocol while TX is pending')
             self._desired = self._confirmed = LogicalState()
             self._suspended = False
+            self.last_error = ""
 
     def suspend(self, error):
         with self._condition:
