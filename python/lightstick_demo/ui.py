@@ -177,8 +177,8 @@ class LightstickApp(LegacyControls, tk.Tk):
     def __init__(self, state_store: StateStore | None = None) -> None:
         super().__init__()
         self.title("Lightstick Lab")
-        self.geometry("900x620")
-        self.minsize(850, 570)
+        self.geometry("900x650")
+        self.minsize(850, 650)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.runner = TaskRunner()
         self.transport: BaseTransport | None = None
@@ -239,12 +239,32 @@ class LightstickApp(LegacyControls, tk.Tk):
         ttk.Button(dialog, text='启动', command=start).grid(row=len(entries), column=1, pady=10)
 
     def _refresh_engine_status(self):
-        tx = self.engine.status()['tx']
-        self.air_activity_var.set(f"TX: {tx['running']}  Pending: {tx['pending']}  Received: {tx['received']}  Dedupe: {tx['deduplicated']}  Coalesced: {tx['coalesced']}  TX: {tx['transmitted']}  Failed: {tx['failed']}  {tx['error']}")
+        status = self.engine.status()
+        tx = status['tx']
+        if tx['error']:
+            summary = '发射状态：' + tx['error']
+        elif tx['running']:
+            summary = '正在发射' + ('，已有最新状态等待发送' if tx['pending'] else '')
+        elif tx['transmitted']:
+            summary = 'Bridge 发射完成；无目标 ACK'
+        else:
+            summary = '准备就绪'
+        # Keep manual operation results/errors until the scheduler state changes.
+        signature = (tx['running'], tx['pending'], tx['transmitted'], tx['failed'], tx['error'])
+        if signature != getattr(self, '_last_tx_signature', None):
+            self.air_activity_var.set(summary)
+            self._last_tx_signature = signature
         external = self.server_manager.status()
         active = '正在监听' if external.get('active') else '未启动'
-        address = external.get('address', '')
-        self.external_status_var.set(f"外部控制：{active} {address}  收包：{external.get('received',0)}  无效：{external.get('malformed',0)}  {external.get('error','')} {self.engine.warning}")
+        address = external.get('address')
+        endpoint = f'{address[0]}:{address[1]}' if address else ''
+        self.external_status_var.set(f"{active}  {endpoint}  {external.get('error','')}")
+        self.external_bridge_var.set(f"Bridge：{'已连接' if status['connected'] else '未连接'}    协议：{self.engine.protocol.display_name}")
+        self.external_tx_var.set(summary + f"    等待状态：{tx['pending']}" + (f"\n{self.engine.warning}" if self.engine.warning else ''))
+        self.external_metrics_var.set(
+            f"接收更新：{tx['received']}    去重：{tx['deduplicated']}    合并：{tx['coalesced']}\n"
+            f"发射完成：{tx['transmitted']}    失败：{tx['failed']}    不支持：{tx['unsupported']}\n"
+            f"网络收包：{external.get('received',0)}    无效包：{external.get('malformed',0)}")
         self.after(200, self._refresh_engine_status)
 
     def _build_style(self) -> None:
@@ -278,10 +298,13 @@ class LightstickApp(LegacyControls, tk.Tk):
         tabs.grid(row=1, column=0, sticky="nsew", padx=12, pady=(2, 12))
         self.lightstick_tab = ttk.Frame(tabs, padding=10)
         self.esp_tab = ttk.Frame(tabs, padding=10)
+        self.external_tab = ttk.Frame(tabs, padding=16)
         tabs.add(self.lightstick_tab, text="应援棒")
         tabs.add(self.esp_tab, text="ESP32")
+        tabs.add(self.external_tab, text="外部控制")
         self._build_lightstick_tab()
         self._build_esp_tab()
+        self._build_external_tab()
 
     @staticmethod
     def _readonly_entry(parent: ttk.Widget, variable: tk.Variable, width: int = 20) -> ttk.Entry:
@@ -307,7 +330,7 @@ class LightstickApp(LegacyControls, tk.Tk):
         preview.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         preview.columnconfigure(1, weight=1)
         ttk.Label(preview, text="命令预览：").grid(row=0, column=0, sticky="w")
-        self._readonly_entry(preview, self.preview_var, 98).grid(row=0, column=1, sticky="ew")
+        self._readonly_entry(preview, self.preview_var, 1).grid(row=0, column=1, sticky="ew")
 
         self._effect_labels = {'off':'熄灭','solid':'常亮','slow':'慢闪','medium':'中闪','fast':'快闪','hold':'保持','fade_in':'Fade in','fade_out':'Fade out'}
         self._effect_ids = {self._effect_labels.get(effect,effect):effect for plugin in self.engine.registry.plugins.values() for effect in plugin.capabilities.effects}
@@ -334,7 +357,7 @@ class LightstickApp(LegacyControls, tk.Tk):
         self.zone_buttons.append(all_button)
         for index, (zone, variable) in enumerate(self.zone_vars.items(), start=2):
             button = ttk.Checkbutton(zones, text=zone, variable=variable, command=self._zone_changed)
-            button.grid(row=index // 10, column=index % 10, sticky="w", padx=1)
+            button.grid(row=index // 18, column=index % 18, sticky="w", padx=1)
             self.zone_buttons.append(button)
 
         body = ttk.Frame(tab)
@@ -417,25 +440,39 @@ class LightstickApp(LegacyControls, tk.Tk):
             row=5, column=0, sticky="w", pady=(5, 0)
         )
 
-        external = ttk.Frame(tab)
-        external.grid(row=6, column=0, sticky='ew', pady=5)
-        self._connector_names = {'关闭': None, **{p.display_name: key for key,p in self.server_manager.registry.plugins.items()}}
-        saved = self._state_store.load_unlocked()
-        self.connector_var = tk.StringVar(value=next((name for name,key in self._connector_names.items() if key == saved['selected_connector']), '关闭'))
-        ttk.Label(external, text='外部控制：').pack(side='left')
-        selector = ttk.Combobox(external, textvariable=self.connector_var, values=tuple(self._connector_names), state='readonly', width=18)
-        selector.pack(side='left')
-        selector.bind('<<ComboboxSelected>>', lambda event: self._switch_connector())
-        ttk.Button(external, text='启动 / 配置', command=self._configure_connector).pack(side='left', padx=5)
-        ttk.Button(external, text='停止', command=self._stop_connector).pack(side='left')
-        self.external_status_var = tk.StringVar(value='未启动')
-        ttk.Label(tab, textvariable=self.external_status_var, wraplength=780).grid(row=7, column=0, sticky='w')
-
         self.air_family_var.trace_add("write", lambda *_: self._family_changed())
         self.color_var.trace_add("write", lambda *_: self._color_changed())
         self.rgb_hex_var.trace_add("write", lambda *_: self.refresh_preview())
         self.air_power_var.trace_add("write", lambda *_: self._update_power_label())
         self._family_changed()
+
+    def _build_external_tab(self):
+        tab = self.external_tab
+        tab.columnconfigure(0, weight=1)
+        connection = ttk.LabelFrame(tab, text='控制来源', padding=14)
+        connection.grid(row=0, column=0, sticky='ew')
+        connection.columnconfigure(1, weight=1)
+        self._connector_names = {'关闭': None, **{p.display_name: key for key,p in self.server_manager.registry.plugins.items()}}
+        saved = self._state_store.load_unlocked()
+        self.connector_var = tk.StringVar(value=next((name for name,key in self._connector_names.items() if key == saved['selected_connector']), '关闭'))
+        ttk.Label(connection, text='外部控制').grid(row=0, column=0, padx=(0,12))
+        selector = ttk.Combobox(connection, textvariable=self.connector_var, values=tuple(self._connector_names), state='readonly', width=22)
+        selector.grid(row=0, column=1, sticky='w')
+        selector.bind('<<ComboboxSelected>>', lambda event: self._switch_connector())
+        ttk.Button(connection, text='启动 / 配置', command=self._configure_connector).grid(row=0, column=2, padx=8)
+        ttk.Button(connection, text='停止', command=self._stop_connector).grid(row=0, column=3)
+        self.external_status_var = tk.StringVar(value='未启动')
+        ttk.Label(connection, textvariable=self.external_status_var, wraplength=700).grid(row=1, column=0, columnspan=4, sticky='w', pady=(12,0))
+        bridge = ttk.LabelFrame(tab, text='发射状态', padding=14)
+        bridge.grid(row=1, column=0, sticky='ew', pady=14)
+        self.external_bridge_var = tk.StringVar(value='Bridge 未连接')
+        ttk.Label(bridge, textvariable=self.external_bridge_var, wraplength=700).grid(row=0, column=0, sticky='w')
+        self.external_tx_var = tk.StringVar(value='等待输入')
+        ttk.Label(bridge, textvariable=self.external_tx_var, wraplength=700).grid(row=1, column=0, sticky='w', pady=(8,0))
+        statistics = ttk.LabelFrame(tab, text='运行统计', padding=14)
+        statistics.grid(row=2, column=0, sticky='ew')
+        self.external_metrics_var = tk.StringVar(value='')
+        ttk.Label(statistics, textvariable=self.external_metrics_var, justify='left', wraplength=700).grid(row=0, column=0, sticky='w')
 
     def _toggle_all_zones(self) -> None:
         selected = self.all_zones_var.get()

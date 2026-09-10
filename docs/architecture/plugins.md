@@ -14,7 +14,7 @@ python -m unittest discover -s tests -v
 PYTHONPATH=. python benchmarks/realtime.py --output ../docs/architecture/benchmark.json
 ```
 
-The GUI has independent protocol and external-control selectors. Select a connector to start with saved settings; use **启动 / 配置** to change host/port. Settings and selected IDs persist in the existing user state directory. A saved connector selection is restored in the UI but does not automatically open a listener on application launch; select it or press the start button. Stop releases its socket before another connector starts. Bridge discovery/identity, transport ownership and transmission execution belong to Engine.
+The GUI has a protocol selector on the manual-control tab and a separate external-control tab for the connector selector, listener status and runtime statistics. Select a connector to start with saved settings; use **启动 / 配置** to change host/port. Settings and selected IDs persist in the existing user state directory. A saved connector selection is restored in the UI but does not automatically open a listener on application launch; select it or press the start button. Stop releases its socket before another connector starts. Bridge discovery/identity, transport ownership and transmission execution belong to Engine.
 
 ## Domain and scheduling
 
