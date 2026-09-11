@@ -22,7 +22,7 @@ The GUI has a protocol selector on the manual-control tab and a separate externa
 
 A scheduler worker owns one running state and at most one latest pending state. It merges partial zone updates before coalescing, preserving changes to different zones. Unchanged confirmed/running/pending state is deduplicated. Only changed zones are handed to a plugin, which rebases them onto the latest persisted protocol shadow under an inter-process lock. The lock covers load, TX completion and atomic save; no protocol candidate is committed before successful bridge completion.
 
-`received`, `deduplicated`, `coalesced`, `unsupported`, `transmitted`, `failed`, pending depth, queue delay and TX duration are observable. Connector counters separately report packets, malformed input and deduplication. LumaFlow caches one parsed packet and still consults core dedupe so manual changes and failed transmissions are respected.
+`received`, `deduplicated`, `coalesced`, `unsupported`, `transmitted`, `failed`, pending depth, queue delay and TX duration are observable. Connector counters separately report packets, malformed input, rejected updates and deduplication. `malformed` counts parse errors; `rejected` counts parsed updates refused by Engine (unsupported capabilities, disconnected or suspended). Unsupported updates also increment Engine's `unsupported` counter. Rejected packets are discarded while the listener remains active, and only new packets can transmit after bridge reconnection. Unexpected parser crashes still stop that connector. LumaFlow caches one parsed packet and still consults core dedupe so manual changes and failed transmissions are respected.
 
 An uncertain submission/result or failed state commit suspends scheduling and drops pending input. Reconnect before resuming; no automatic waveform retransmission is attempted. A protocol change while running/pending is rejected rather than applying a queued update through the wrong protocol. Explicit CLI and manual GUI commands are Engine transactions; GUI runs them in a background worker. Each completed manual click can transmit again, including repeated identical states and changed radio settings. Network streams alone use state deduplication. A manual transaction drains running RF and supersedes pending stream state before executing; later network input resumes scheduling.
 
@@ -59,7 +59,9 @@ Built-ins are **00 短命令** (`protocol_00`, A–P, palette, fade/hold) and **
 
 State v2 holds `selected_protocol`, `protocol_states`, `selected_connector`, and `connector_configs`. Legacy `d8_slots` migrates into `protocol_states.protocol_d8.slots` once and remains a compatibility mirror; existing files and unrelated plugin state are preserved. Canonical v2 plugin state takes precedence over that mirror. A missing selected plugin falls back to an available plugin with a visible warning.
 
-The historical `protocol.py`, legacy controller helpers and advanced C0/A6/DA dialogs remain available for migration compatibility. Active protocol control uses Engine and capabilities. Legacy helper API compatibility is tested, and generic advanced TX also shares Engine's RF lock.
+The historical `protocol.py` reexports the sole waveform implementation in `protocols/_common.py`; legacy controller helpers and advanced C0/A6/DA dialogs remain available for migration compatibility. Active protocol control uses Engine and capabilities. Legacy helper API compatibility is tested, and generic advanced TX also shares Engine's RF lock.
+
+If the GUI cannot load its state file, it opens with a visible error and display-only defaults. The damaged file is never replaced with those defaults. Preview, protocol changes and TX continue to load the original store and fail until the file is repaired. CLI startup still reports the state error. Read-only preview and configuration snapshots use atomic-replace consistency without taking the state lock; read-modify-write transactions and TX retain the lock across their full operation.
 
 ## Connector contract
 
@@ -83,7 +85,7 @@ class Example(UdpConnector):
 CONNECTOR = Example()
 ```
 
-Stop must release sockets and join threads before returning. Startup failure leaves the manager inactive; parser failure does not disconnect the bridge. Application shutdown closes the manager, then stops the scheduler and disconnects the bridge. UDP listeners accept traffic on their configured bind address; use loopback when only local software should send.
+Stop must release sockets and join threads before returning. Startup failure leaves the manager inactive and the GUI selector returns to Off; parser failure does not disconnect the bridge. Application shutdown closes the manager, then stops the scheduler and disconnects the bridge. Both built-in UDP listeners intentionally default to `0.0.0.0` for control from another computer on the LAN. They do not authenticate senders; bind to `127.0.0.1` when only local software should send.
 
 ## LumaFlow and CuePilot
 

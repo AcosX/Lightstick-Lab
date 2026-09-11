@@ -8,7 +8,7 @@ class UdpConnector:
         self._thread = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        self._status = {'active': False, 'received': 0, 'malformed': 0, 'deduplicated': 0, 'error': ''}
+        self._status = {'active': False, 'received': 0, 'malformed': 0, 'rejected': 0, 'deduplicated': 0, 'error': ''}
 
     def __deepcopy__(self, memo):
         return type(self)()
@@ -30,7 +30,7 @@ class UdpConnector:
         self._stop.clear()
         with self._lock:
             self._status = {'active': True, 'address': sock.getsockname(), 'received': 0,
-                            'malformed': 0, 'deduplicated': 0, 'error': ''}
+                            'malformed': 0, 'rejected': 0, 'deduplicated': 0, 'error': ''}
         self._thread = threading.Thread(target=self._run, name=self.id, daemon=True)
         self._thread.start()
 
@@ -60,15 +60,26 @@ class UdpConnector:
                     self._status['received'] += 1
                 try:
                     updates = self.parse(packet)
-                    if updates:
-                        accepted = self.context.submit_update(updates)
-                        if not accepted:
-                            with self._lock:
-                                self._status['deduplicated'] += 1
                 except ValueError as exc:
                     with self._lock:
                         self._status['malformed'] += 1
                         self._status['error'] = str(exc)
+                    continue
+                if updates:
+                    try:
+                        accepted = self.context.submit_update(updates)
+                    except (ValueError, RuntimeError) as exc:
+                        # Valid input can be unsupported, disconnected or suspended.
+                        # Drop it without replaying; keep listening for post-recovery
+                        # input. Parser/programming failures still reach the outer guard.
+                        with self._lock:
+                            self._status['rejected'] += 1
+                            self._status['error'] = str(exc)
+                    else:
+                        with self._lock:
+                            self._status['error'] = ''
+                            if not accepted:
+                                self._status['deduplicated'] += 1
         except Exception as exc:
             with self._lock:
                 self._status['error'] = str(exc)

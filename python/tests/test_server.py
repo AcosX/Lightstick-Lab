@@ -69,6 +69,8 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda:self.engine.status()['tx']['unsupported']==1))
         self.assertIn('J', self.engine.status()['tx']['error'])
         self.assertEqual(self.engine.status()['tx']['transmitted'], 0)
+        self.assertTrue(wait_for(lambda:self.manager.status()['rejected']==1))
+        self.assertEqual(self.manager.status()['malformed'], 0)
     def test_port_conflict_inactive_and_manual_survives(self):
         with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
             sock.bind(('127.0.0.1',0))
@@ -84,6 +86,38 @@ class AdditionalServerTests(unittest.TestCase):
     setUp = ServerTests.setUp
     tearDown = ServerTests.tearDown
     send = ServerTests.send
+    def test_stream_survives_disconnect_and_uncertain_tx_then_attach(self):
+        from lightstick_demo.transports import TransportTimeoutError
+        for connector, packet in [('cuepilot', osc('A', 3)),
+                                  ('lumaflow', tlv(bytes([3, 0])+bytes(18)))]:
+            for failure in ('disconnect', 'uncertain'):
+                with self.subTest(connector=connector, failure=failure):
+                    self.engine.attach(FakeTransport('before'))
+                    self.manager.switch(connector, {'host':'127.0.0.1','port':0})
+                    address = self.manager.status()['address']
+                    if failure == 'disconnect':
+                        self.engine.disconnect()
+                    else:
+                        self.engine.transport.responses = [TransportTimeoutError('lost TX ACK')]
+                        self.send(packet)
+                        self.assertTrue(wait_for(lambda:self.engine.status()['tx']['suspended']))
+                        self.assertTrue(self.engine.scheduler.wait_idle())
+                    for count in range(1, 4):
+                        self.send(packet)
+                        self.assertTrue(wait_for(lambda:self.manager.status().get('rejected',0)==count))
+                    self.assertTrue(self.manager.status()['active'])
+                    self.assertEqual(self.manager.status()['malformed'], 0)
+                    self.assertEqual(self.engine.status()['tx']['pending'], 0)
+                    recovered = FakeTransport('recovered')
+                    self.engine.attach(recovered)
+                    self.assertEqual(recovered.calls[0][0], 'GET_INFO')
+                    self.assertEqual(len(recovered.calls), 1)  # rejected input is never replayed
+                    before = self.engine.status()['tx']['transmitted']
+                    self.send(packet)
+                    self.assertTrue(wait_for(lambda:self.engine.status()['tx']['transmitted']==before+1))
+                    self.assertEqual(self.manager.status()['address'], address)
+                    self.assertEqual(self.manager.status()['error'], '')
+                    self.manager.stop()
     def test_malformed_then_valid_keeps_listener_alive(self):
         self.manager.switch('cuepilot', {'host':'127.0.0.1','port':0})
         self.send(b'bad')

@@ -29,6 +29,15 @@ from lightstick_demo.protocol import (
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_legacy_api_reexports_shared_waveform_implementation(self):
+        from lightstick_demo import protocol
+        from lightstick_demo.protocols import _common
+        for name in ('PulseSequence', 'build_d8_transaction', 'build_partition_frame', 'encode_air_pulses'):
+            self.assertIs(getattr(protocol, name), getattr(_common, name))
+        namespace = {}
+        exec('from lightstick_demo.protocol import *', namespace)
+        self.assertIs(namespace['PulseSequence'], _common.PulseSequence)
+
     def test_verified_frames_and_checksums(self) -> None:
         self.assertEqual(hex_bytes(build_partition_frame(0xFF, 0xFF, 0xFF, 1, 0)), "00 FF FF FF 01 00 94")
         self.assertEqual(hex_bytes(build_partition_frame(0xFF, 0xFF, 0xFF, 1, 1)), "00 FF FF FF 01 01 95")

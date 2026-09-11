@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 from lightstick_demo.ui import LightstickApp
 from lightstick_demo.state import StateStore
+from lightstick_demo.state import StateError, default_state
 from lightstick_demo.transports import BleTransport, TransportStatus
 from test_cli_control import FakeTransport
 from test_recording import RecordingTransport
@@ -35,6 +36,35 @@ class FakeBridge(FakeTransport):
 
 class FakeBleBridge(FakeBridge, BleTransport):
     pass
+
+class CorruptStateTests(unittest.TestCase):
+    def test_gui_opens_without_overwriting_bad_state_and_recovers_after_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory))
+            damaged = b'{corrupt json!!'
+            store.path.write_bytes(damaged)
+            app = None
+            try:
+                try:
+                    app = LightstickApp(store)
+                except tk.TclError as exc:
+                    self.skipTest(f'Tk display unavailable: {exc}')
+                app.update()
+                self.assertIn('无法读取状态', app.engine.warning)
+                self.assertFalse(app._preview_valid)
+                bridge = FakeBridge()
+                app.engine.attach(bridge)
+                from lightstick_demo.model import LogicalUpdate
+                with self.assertRaises(StateError):
+                    app.engine.execute_update(LogicalUpdate(('A',),(15,0,0)))
+                self.assertFalse(any(c.startswith('TX_') for c,_,_ in bridge.calls))
+                self.assertEqual(store.path.read_bytes(), damaged)
+                # Explicit repair restores normal operation using the original store.
+                store.save_unlocked(default_state())
+                app.engine.execute_update(LogicalUpdate(('A',),(15,0,0)))
+                self.assertTrue(any(c=='TX_PULSES' for c,_,_ in bridge.calls))
+            finally:
+                if app is not None: app._close()
 
 class InteractionTests(unittest.TestCase):
     @classmethod
@@ -178,6 +208,22 @@ class InteractionTests(unittest.TestCase):
         self.button(self.app.external_tab,'停止').invoke(); self.drain()
         self.assertFalse(self.app.server_manager.status()['active'])
         self.app.air_repeat_var.set('1')
+    def test_failed_connector_switch_restores_actual_selection(self):
+        import socket
+        self.app.server_manager.switch('lumaflow', {'host':'127.0.0.1','port':0})
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as occupied:
+            occupied.bind(('127.0.0.1', 0))
+            store = self.app.engine.store
+            with store.locked():
+                state = store.load_unlocked()
+                state['connector_configs']['cuepilot'] = {'host':'127.0.0.1','port':occupied.getsockname()[1]}
+                store.save_unlocked(state)
+            self.app.connector_var.set('CuePilot OSC')
+            self.app._switch_connector(); self.drain()
+        self.assertFalse(self.app.server_manager.status()['active'])
+        self.assertEqual(self.app.connector_var.get(), '关闭')
+        self.assertEqual(len(self.errors), 1)
+        self.errors.clear()
     def test_all_short_command_effects_and_colors_match_legacy_frames(self):
         from lightstick_demo.protocol import build_partition_frame
         legacy_states={'熄灭':0,'常亮':1,'慢闪':2,'中闪':3,'快闪':4,'Fade in':5,'Fade out':6,'保持':11}

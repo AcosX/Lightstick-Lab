@@ -25,7 +25,7 @@ from .protocol import MAX_TX_REPEAT, encode_air_pulses, hex_bytes, tx_pulses_arg
 from ._legacy_ui import LegacyControls, palette_hex, d8_rgb_from_hex as rgb_from_hex
 from ._legacy_ui import COLOR_OPTIONS
 from .recording import ClientRecording
-from .state import StateError, StateStore
+from .state import StateError, StateStore, default_state
 from .transports import (
     BLE_DEVICE_NAME,
     BaseTransport,
@@ -187,7 +187,17 @@ class LightstickApp(LegacyControls, tk.Tk):
         self._record_valid_data_seen = False
         self.c0_colors = [0] * 10
         self._state_store = state_store or StateStore()
-        self.engine = Engine(store=self._state_store)
+        startup_error = ''
+        try:
+            self._startup_state = self._state_store.load_unlocked()
+        except StateError as exc:
+            # Display defaults only. Never overwrite a damaged file or use
+            # guessed protocol state for TX; Engine operations reload the store.
+            self._startup_state = default_state()
+            startup_error = f'状态文件读取失败，请修复 {self._state_store.path} 后重试：{exc}'
+        self.engine = Engine(store=self._state_store, initial_state=self._startup_state)
+        if startup_error:
+            self.engine.warning = startup_error
         self.engine.start()
         self.server_manager = ServerManager(self.engine)
         self._busy_tasks: set[str] = set()
@@ -200,12 +210,19 @@ class LightstickApp(LegacyControls, tk.Tk):
         self._build_style()
         self._build_header()
         self._build_tabs()
+        if startup_error:
+            self.air_activity_var.set(startup_error)
         self._worker_after_id = self.after(80, self._poll_worker_events)
         self._status_after_id = self.after(200, self._refresh_engine_status)
 
     def _stop_connector(self):
         self.connector_var.set('关闭')
         self._switch_connector()
+
+    def _restore_connector_selection(self, _error=None):
+        connector = self.server_manager.connector
+        key = connector.id if connector and connector.status().get('active') else None
+        self.connector_var.set(next(name for name, value in self._connector_names.items() if value == key))
 
     def _switch_connector(self):
         key = self._connector_names[self.connector_var.get()]
@@ -215,9 +232,12 @@ class LightstickApp(LegacyControls, tk.Tk):
                 frequency, repeat, gap, power = self._tx_settings()
                 self.engine.radio = RadioSettings(frequency, power, repeat, gap)
         except Exception as exc:
+            self._restore_connector_selection()
             self._show_error('外部控制参数无效', str(exc))
             return
-        if not self._submit('connector-switch', lambda: self.server_manager.switch(key, config), '外部控制已切换'):
+        if not self._submit('connector-switch', lambda: self.server_manager.switch(key, config), '外部控制已切换',
+                            self._restore_connector_selection, self._restore_connector_selection):
+            self._restore_connector_selection()
             self.external_status_var.set('正在切换，请等待当前操作完成')
 
     def _configure_connector(self):
@@ -226,7 +246,12 @@ class LightstickApp(LegacyControls, tk.Tk):
             self._switch_connector()
             return
         plugin = self.server_manager.registry.plugins[key]
-        saved = self._state_store.load_unlocked()['connector_configs'].get(key, {})
+        try:
+            saved = self._state_store.load_unlocked()['connector_configs'].get(key, {})
+        except StateError as exc:
+            self._restore_connector_selection()
+            self._show_error('外部控制参数无效', str(exc))
+            return
         config = {**plugin.default_config, **saved}
         dialog = self._modal(self, plugin.display_name, '420x240')
         entries = {}
@@ -246,9 +271,10 @@ class LightstickApp(LegacyControls, tk.Tk):
                 self.engine.radio = radio
                 self.server_manager.switch(key, settings)
             def done(_):
+                self._restore_connector_selection()
                 if dialog.winfo_exists():
                     dialog.destroy()
-            if not self._submit('connector-switch', operation, '外部控制已启动', done):
+            if not self._submit('connector-switch', operation, '外部控制已启动', done, self._restore_connector_selection):
                 self.external_status_var.set('正在切换，请等待当前操作完成')
         ttk.Button(dialog, text='启动', command=start).grid(row=len(entries), column=1, pady=10)
 
@@ -279,7 +305,7 @@ class LightstickApp(LegacyControls, tk.Tk):
         self.external_metrics_var.set(
             f"接收更新：{tx['received']}    去重：{tx['deduplicated']}    合并：{tx['coalesced']}\n"
             f"发射完成：{tx['transmitted']}    失败：{tx['failed']}    不支持：{tx['unsupported']}\n"
-            f"网络收包：{external.get('received',0)}    无效包：{external.get('malformed',0)}")
+            f"网络收包：{external.get('received',0)}    无效包：{external.get('malformed',0)}    拒绝：{external.get('rejected',0)}")
         self._status_after_id = self.after(200, self._refresh_engine_status)
 
     def _build_style(self) -> None:
@@ -473,7 +499,7 @@ class LightstickApp(LegacyControls, tk.Tk):
         connection.grid(row=0, column=0, sticky='ew')
         connection.columnconfigure(1, weight=1)
         self._connector_names = {'关闭': None, **{p.display_name: key for key,p in self.server_manager.registry.plugins.items()}}
-        saved = self._state_store.load_unlocked()
+        saved = self._startup_state
         self.connector_var = tk.StringVar(value=next((name for name,key in self._connector_names.items() if key == saved['selected_connector']), '关闭'))
         ttk.Label(connection, text='外部控制').grid(row=0, column=0, padx=(0,12))
         selector = ttk.Combobox(connection, textvariable=self.connector_var, values=tuple(self._connector_names), state='readonly', width=22)
@@ -722,7 +748,6 @@ class LightstickApp(LegacyControls, tk.Tk):
         if not isinstance(transport, BaseTransport):
             self._show_error("连接失败", "传输实例无效")
             return
-        old = None
         self.transport = transport
         self._update_transport_status(result["status"])
         if result["status"].kind == "USB Serial":
@@ -732,8 +757,6 @@ class LightstickApp(LegacyControls, tk.Tk):
             url = http_url_from_network_status(result.get("network"))
             if url:
                 self.http_url_var.set(url)
-        if old is not None and old is not transport:
-            threading.Thread(target=self._best_effort_disconnect, args=(old,), daemon=True).start()
         self.refresh_bridge_status()
 
     @staticmethod

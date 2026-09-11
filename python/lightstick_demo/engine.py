@@ -10,11 +10,13 @@ from .state import StateStore
 from .transports import TransportError
 
 class Engine:
-    def __init__(self, store=None, discovery=None, registry=None, protocol_id=None):
+    def __init__(self, store=None, discovery=None, registry=None, protocol_id=None, *, initial_state=None):
         self.store = store or StateStore()
         self.discovery = discovery or AutoDiscovery()
         self.registry = registry or ProtocolRegistry()
-        state = self.store.load_unlocked()
+        # A GUI-only startup snapshot may display defaults after a load error.
+        # All operational reads/writes still use the original store and fail closed.
+        state = self.store.load_unlocked() if initial_state is None else initial_state
         self.protocol = self.registry.resolve(protocol_id or state['selected_protocol'])
         self.warning = '' if (protocol_id or state['selected_protocol']) in self.registry.plugins else 'Selected protocol unavailable; using ' + self.protocol.display_name
         if self.registry.errors:
@@ -73,6 +75,7 @@ class Engine:
             self.scheduler.reset(recover=True)
             old = self.transport
             self.transport = transport
+            self._accepting = True
             if old is not None and old is not transport:
                 old.disconnect()
 
@@ -94,15 +97,26 @@ class Engine:
         for update in updates:
             self.protocol.capabilities.validate(update)
 
+    def _filter_inactive_blackout_zones(self, updates):
+        # LumaFlow sends ten slots even for protocols with fewer zones. Ignore
+        # only inactive black slots outside this protocol; active ones must fail
+        # capability validation so an unintended region is never silently dropped.
+        filtered = []
+        for update in updates:
+            if update.rgb == (0, 0, 0) and update.effect in ('solid', 'off'):
+                zones = tuple(z for z in update.zones if z in self.protocol.capabilities.zones)
+                if not zones:
+                    continue
+                update = LogicalUpdate(zones, update.rgb, update.effect, update.palette)
+            filtered.append(update)
+        return tuple(filtered)
+
     def submit_update(self, updates):
         updates = (updates,) if isinstance(updates, LogicalUpdate) else tuple(updates)
         with self._input_lock:
             if not self._accepting:
                 raise RuntimeError('Engine stopped')
-            updates = tuple(LogicalUpdate(tuple(z for z in u.zones if z in self.protocol.capabilities.zones), u.rgb, u.effect, u.palette)
-                            if u.rgb == (0,0,0) and u.effect in ('solid','off') else u
-                            for u in updates
-                            if not (u.rgb == (0,0,0) and u.effect in ('solid','off') and not set(u.zones).intersection(self.protocol.capabilities.zones)))
+            updates = self._filter_inactive_blackout_zones(updates)
             try:
                 self._validate(updates)
             except ValueError as exc:
