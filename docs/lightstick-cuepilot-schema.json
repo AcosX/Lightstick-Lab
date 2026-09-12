@@ -1,0 +1,191 @@
+{
+  "id": "lightstick-lab",
+  "label": "Lightstick Lab",
+  "description": "Lightstick Lab OSC control. UDP port 9000. RGB444 (0-15).",
+  "commands": [
+    {
+      "id": "zone",
+      "label": "Single Zone",
+      "description": "RGB: integers 0-15. Effects: solid, slow, medium, fast, off, fade_in, fade_out, hold. D8 supports only solid/slow/medium/fast/off. Zones: 00 A-P; D8 A-I.\n/lightstick/zone",
+      "address": "/lightstick/zone",
+      "args": [
+        {
+          "id": "zones",
+          "caption": "Zone",
+          "type": "s",
+          "edittype": "string",
+          "default": "A",
+          "maxlength": 31,
+          "discardInArgs": false
+        },
+        {
+          "id": "r",
+          "caption": "R (0-15)",
+          "type": "i",
+          "edittype": "integer",
+          "default": 0,
+          "range": [
+            0,
+            15
+          ],
+          "discardInArgs": false
+        },
+        {
+          "id": "g",
+          "caption": "G (0-15)",
+          "type": "i",
+          "edittype": "integer",
+          "default": 0,
+          "range": [
+            0,
+            15
+          ],
+          "discardInArgs": false
+        },
+        {
+          "id": "b",
+          "caption": "B (0-15)",
+          "type": "i",
+          "edittype": "integer",
+          "default": 0,
+          "range": [
+            0,
+            15
+          ],
+          "discardInArgs": false
+        },
+        {
+          "id": "effect",
+          "caption": "Effect",
+          "type": "s",
+          "edittype": "string",
+          "default": "solid",
+          "maxlength": 16,
+          "discardInArgs": false
+        }
+      ]
+    },
+    {
+      "id": "state",
+      "label": "Multiple Zones",
+      "description": "RGB: integers 0-15. Effects: solid, slow, medium, fast, off, fade_in, fade_out, hold. D8 supports only solid/slow/medium/fast/off. Zones: 00 A-P; D8 A-I.\n/lightstick/state",
+      "address": "/lightstick/state",
+      "args": [
+        {
+          "id": "zones",
+          "caption": "Zones (comma-separated)",
+          "type": "s",
+          "edittype": "string",
+          "default": "A,B",
+          "maxlength": 31,
+          "discardInArgs": false
+        },
+        {
+          "id": "r",
+          "caption": "R (0-15)",
+          "type": "i",
+          "edittype": "integer",
+          "default": 0,
+          "range": [
+            0,
+            15
+          ],
+          "discardInArgs": false
+        },
+        {
+          "id": "g",
+          "caption": "G (0-15)",
+          "type": "i",
+          "edittype": "integer",
+          "default": 0,
+          "range": [
+            0,
+            15
+          ],
+          "discardInArgs": false
+        },
+        {
+          "id": "b",
+          "caption": "B (0-15)",
+          "type": "i",
+          "edittype": "integer",
+          "default": 0,
+          "range": [
+            0,
+            15
+          ],
+          "discardInArgs": false
+        },
+        {
+          "id": "effect",
+          "caption": "Effect",
+          "type": "s",
+          "edittype": "string",
+          "default": "solid",
+          "maxlength": 16,
+          "discardInArgs": false
+        }
+      ]
+    },
+    {
+      "id": "all",
+      "label": "All Zones",
+      "description": "RGB: integers 0-15. Effects: solid, slow, medium, fast, off, fade_in, fade_out, hold. D8 supports only solid/slow/medium/fast/off. Zones: 00 A-P; D8 A-I.\n/lightstick/all",
+      "address": "/lightstick/all",
+      "args": [
+        {
+          "id": "r",
+          "caption": "R (0-15)",
+          "type": "i",
+          "edittype": "integer",
+          "default": 0,
+          "range": [
+            0,
+            15
+          ],
+          "discardInArgs": false
+        },
+        {
+          "id": "g",
+          "caption": "G (0-15)",
+          "type": "i",
+          "edittype": "integer",
+          "default": 0,
+          "range": [
+            0,
+            15
+          ],
+          "discardInArgs": false
+        },
+        {
+          "id": "b",
+          "caption": "B (0-15)",
+          "type": "i",
+          "edittype": "integer",
+          "default": 0,
+          "range": [
+            0,
+            15
+          ],
+          "discardInArgs": false
+        },
+        {
+          "id": "effect",
+          "caption": "Effect",
+          "type": "s",
+          "edittype": "string",
+          "default": "solid",
+          "maxlength": 16,
+          "discardInArgs": false
+        }
+      ]
+    },
+    {
+      "id": "blackout",
+      "label": "Blackout",
+      "description": "Turn off all active protocol zones.\n/lightstick/blackout",
+      "address": "/lightstick/blackout",
+      "args": []
+    }
+  ]
+}

@@ -16,36 +16,16 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from . import __version__
-from .controller import (
-    Controller,
-    TX_POLL_MIN_TIMEOUT_SECONDS,
-    d8_slots_for_zones,
-    d8_state_after_tx,
-    d8_tx_commands,
-    d8_update_slots,
-    execute_persistent_d8_tx,
-    tx_poll_timeout_seconds,
-    wait_for_tx_result,
-)
+from .engine import Engine
+from .server.manager import ServerManager
+from .model import LogicalUpdate, RadioSettings
+from .controller import TX_POLL_MIN_TIMEOUT_SECONDS, tx_poll_timeout_seconds, wait_for_tx_result
 from .discovery import is_target_ble_device
-from .protocol import (
-    COLOR_NAMES,
-    DEFAULT_D8_PHASES,
-    D8_ZONES,
-    MAX_TX_REPEAT,
-    build_a6_frame,
-    build_c0_frame,
-    build_d8_frames_from_slots,
-    build_da_frame,
-    build_partition_frame,
-    d8_word,
-    encode_air_pulses,
-    hex_bytes,
-    zone_mask,
-    tx_pulses_args,
-)
+from .protocol import MAX_TX_REPEAT, encode_air_pulses, hex_bytes, tx_pulses_args
+from ._legacy_ui import LegacyControls, palette_hex, d8_rgb_from_hex as rgb_from_hex
+from ._legacy_ui import COLOR_OPTIONS
 from .recording import ClientRecording
-from .state import DEFAULT_D8_SLOTS, StateError, StateStore
+from .state import StateError, StateStore, default_state
 from .transports import (
     BLE_DEVICE_NAME,
     BaseTransport,
@@ -63,37 +43,6 @@ NETWORK_POLL_TIMEOUT_SECONDS = 40.0
 NETWORK_POLL_INTERVAL_SECONDS = 0.5
 VALID_RECORD_THRESHOLD = 32
 
-COMMAND_STATES = {
-    "熄灭": 0x00,
-    "常亮": 0x01,
-    "慢闪": 0x02,
-    "中闪": 0x03,
-    "快闪": 0x04,
-    "Fade in": 0x05,
-    "Fade out": 0x06,
-    "保持": 0x0B,
-}
-D8_FUNCTIONS = {"常亮": 0, "慢闪": 1, "中闪": 2, "快闪": 3}
-D8_DISABLED_STATES = {"保持", "Fade in", "Fade out"}
-COLOR_OPTIONS = tuple((code, name) for code, name in COLOR_NAMES.items() if code != 0xAA)
-PALETTE_HEX = {
-    0x00: "#FF0000",
-    0x01: "#00B51A",
-    0x02: "#1878FF",
-    0x03: "#FF007C",
-    0x04: "#FFFFFF",
-    0x05: "#FFD400",
-    0x06: "#66CCFF",
-    0x07: "#00D878",
-    0x08: "#8A4DFF",
-    0x09: "#FF6A00",
-    0x0A: "#FF8AE0",
-    0x0B: "#1B90FF",
-    0x0C: "#FFF29A",
-    0x0D: "#007B66",
-    0x0E: "#FF5C5C",
-    0x0F: "#F8FAFF",
-}
 NO_VALID_RECORD_WARNING = "警告：截止目前未接收到有效数据。"
 
 
@@ -178,35 +127,6 @@ def select_preferred_serial_port(ports: list[dict[str, str]]) -> dict[str, str] 
     return usable[0] if usable else None
 
 
-def d8_rgb_from_hex(value: str) -> tuple[int, int, int]:
-    """Convert a CSS-style RGB colour to the canonical 4-bit D8 values."""
-
-    text = value.strip()
-    if text.startswith("#"):
-        text = text[1:]
-    if not re.fullmatch(r"[0-9A-Fa-f]{6}", text):
-        raise ValueError("D8 颜色必须是 #RRGGBB")
-    channels = (int(text[index : index + 2], 16) for index in range(0, 6, 2))
-    return tuple(min(15, (channel + 8) // 17) for channel in channels)  # type: ignore[return-value]
-
-
-def palette_hex(code: int) -> str:
-    """Return the closest CSS colour for a documented 4-bit palette code."""
-
-    try:
-        return PALETTE_HEX[int(code)]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("颜色 code 必须为 0..15") from exc
-
-
-def d8_tx_completion_text(state_changed: bool) -> str:
-    """Describe bridge completion without implying a target-side ACK."""
-
-    if not state_changed:
-        return "TX 完成：6 帧 / 1 事务（与本地记录状态相同；棒端无 ACK）"
-    return "TX 完成：6 帧 / 1 事务（棒端无 ACK）"
-
-
 def profile_tx_command(profile: dict[str, Any]) -> tuple[str, dict[str, str]]:
     """Choose the bridge TX command from a freshly-read board Profile."""
 
@@ -251,14 +171,14 @@ def recover_recording_session(
     return {"stop": stopped, **drained}
 
 
-class LightstickApp(tk.Tk):
+class LightstickApp(LegacyControls, tk.Tk):
     """The compact two-tab desktop demo."""
 
     def __init__(self, state_store: StateStore | None = None) -> None:
         super().__init__()
         self.title("Lightstick Lab")
-        self.geometry("900x620")
-        self.minsize(850, 570)
+        self.geometry("900x650")
+        self.minsize(850, 650)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.runner = TaskRunner()
         self.transport: BaseTransport | None = None
@@ -267,12 +187,19 @@ class LightstickApp(tk.Tk):
         self._record_valid_data_seen = False
         self.c0_colors = [0] * 10
         self._state_store = state_store or StateStore()
+        startup_error = ''
         try:
-            self._d8_slots = tuple(self._state_store.load_unlocked()["d8_slots"])
-        except StateError:
-            # Preview construction will surface the persistent-state error.
-            # Do not overwrite a malformed state file with a guessed default.
-            self._d8_slots = DEFAULT_D8_SLOTS
+            self._startup_state = self._state_store.load_unlocked()
+        except StateError as exc:
+            # Display defaults only. Never overwrite a damaged file or use
+            # guessed protocol state for TX; Engine operations reload the store.
+            self._startup_state = default_state()
+            startup_error = f'状态文件读取失败，请修复 {self._state_store.path} 后重试：{exc}'
+        self.engine = Engine(store=self._state_store, initial_state=self._startup_state)
+        if startup_error:
+            self.engine.warning = startup_error
+        self.engine.start()
+        self.server_manager = ServerManager(self.engine)
         self._busy_tasks: set[str] = set()
         self._task_callbacks: dict[str, tuple[str, Callable[[Any], None] | None, Callable[[str], None] | None]] = {}
         self._preview_valid = False
@@ -283,7 +210,103 @@ class LightstickApp(tk.Tk):
         self._build_style()
         self._build_header()
         self._build_tabs()
-        self.after(80, self._poll_worker_events)
+        if startup_error:
+            self.air_activity_var.set(startup_error)
+        self._worker_after_id = self.after(80, self._poll_worker_events)
+        self._status_after_id = self.after(200, self._refresh_engine_status)
+
+    def _stop_connector(self):
+        self.connector_var.set('关闭')
+        self._switch_connector()
+
+    def _restore_connector_selection(self, _error=None):
+        connector = self.server_manager.connector
+        key = connector.id if connector and connector.status().get('active') else None
+        self.connector_var.set(next(name for name, value in self._connector_names.items() if value == key))
+
+    def _switch_connector(self):
+        key = self._connector_names[self.connector_var.get()]
+        try:
+            config = self._state_store.load_unlocked()['connector_configs'].get(key, {})
+            if key is not None:
+                frequency, repeat, gap, power = self._tx_settings()
+                self.engine.radio = RadioSettings(frequency, power, repeat, gap)
+        except Exception as exc:
+            self._restore_connector_selection()
+            self._show_error('外部控制参数无效', str(exc))
+            return
+        if not self._submit('connector-switch', lambda: self.server_manager.switch(key, config), '外部控制已切换',
+                            self._restore_connector_selection, self._restore_connector_selection):
+            self._restore_connector_selection()
+            self.external_status_var.set('正在切换，请等待当前操作完成')
+
+    def _configure_connector(self):
+        key = self._connector_names[self.connector_var.get()]
+        if key is None:
+            self._switch_connector()
+            return
+        plugin = self.server_manager.registry.plugins[key]
+        try:
+            saved = self._state_store.load_unlocked()['connector_configs'].get(key, {})
+        except StateError as exc:
+            self._restore_connector_selection()
+            self._show_error('外部控制参数无效', str(exc))
+            return
+        config = {**plugin.default_config, **saved}
+        dialog = self._modal(self, plugin.display_name, '420x240')
+        entries = {}
+        for index, (name, kind) in enumerate(plugin.config_schema.items()):
+            ttk.Label(dialog, text=name).grid(row=index, column=0, padx=10, pady=8)
+            entries[name] = tk.StringVar(value=str(config.get(name, '')))
+            ttk.Entry(dialog, textvariable=entries[name]).grid(row=index, column=1)
+        def start():
+            try:
+                settings = {name: int(var.get()) if plugin.config_schema[name] == 'integer' else var.get() for name,var in entries.items()}
+                frequency, repeat, gap, power = self._tx_settings()
+                radio = RadioSettings(frequency, power, repeat, gap)
+            except Exception as exc:
+                self._show_error('外部控制启动失败', str(exc))
+                return
+            def operation():
+                self.engine.radio = radio
+                self.server_manager.switch(key, settings)
+            def done(_):
+                self._restore_connector_selection()
+                if dialog.winfo_exists():
+                    dialog.destroy()
+            if not self._submit('connector-switch', operation, '外部控制已启动', done, self._restore_connector_selection):
+                self.external_status_var.set('正在切换，请等待当前操作完成')
+        ttk.Button(dialog, text='启动', command=start).grid(row=len(entries), column=1, pady=10)
+
+    def _refresh_engine_status(self):
+        status = self.engine.status()
+        tx = status['tx']
+        if tx['error']:
+            summary = '发射状态：' + tx['error']
+        elif tx['running']:
+            summary = '正在发射' + ('，已有最新状态等待发送' if tx['pending'] else '')
+        elif tx['transmitted']:
+            summary = 'Bridge 发射完成；无目标 ACK'
+        else:
+            summary = '准备就绪'
+        # Keep manual operation results/errors until the scheduler state changes.
+        signature = (tx['running'], tx['pending'], tx['transmitted'], tx['failed'], tx['error'])
+        previous = getattr(self, '_last_tx_signature', None)
+        if previous is not None and signature != previous and 'air-tx' not in self._busy_tasks:
+            self.air_activity_var.set(summary)
+        self._last_tx_signature = signature
+        external = self.server_manager.status()
+        active = '正在监听' if external.get('active') else '未启动'
+        address = external.get('address')
+        endpoint = f'{address[0]}:{address[1]}' if address else ''
+        self.external_status_var.set(f"{active}  {endpoint}  {external.get('error','')}")
+        self.external_bridge_var.set(f"Bridge：{'已连接' if status['connected'] else '未连接'}    协议：{self.engine.protocol.display_name}")
+        self.external_tx_var.set(summary + f"    等待状态：{tx['pending']}" + (f"\n{self.engine.warning}" if self.engine.warning else ''))
+        self.external_metrics_var.set(
+            f"接收更新：{tx['received']}    去重：{tx['deduplicated']}    合并：{tx['coalesced']}\n"
+            f"发射完成：{tx['transmitted']}    失败：{tx['failed']}    不支持：{tx['unsupported']}\n"
+            f"网络收包：{external.get('received',0)}    无效包：{external.get('malformed',0)}    拒绝：{external.get('rejected',0)}")
+        self._status_after_id = self.after(200, self._refresh_engine_status)
 
     def _build_style(self) -> None:
         style = ttk.Style(self)
@@ -316,10 +339,13 @@ class LightstickApp(tk.Tk):
         tabs.grid(row=1, column=0, sticky="nsew", padx=12, pady=(2, 12))
         self.lightstick_tab = ttk.Frame(tabs, padding=10)
         self.esp_tab = ttk.Frame(tabs, padding=10)
+        self.external_tab = ttk.Frame(tabs, padding=16)
         tabs.add(self.lightstick_tab, text="应援棒")
         tabs.add(self.esp_tab, text="ESP32")
+        tabs.add(self.external_tab, text="外部控制")
         self._build_lightstick_tab()
         self._build_esp_tab()
+        self._build_external_tab()
 
     @staticmethod
     def _readonly_entry(parent: ttk.Widget, variable: tk.Variable, width: int = 20) -> ttk.Entry:
@@ -345,32 +371,39 @@ class LightstickApp(tk.Tk):
         preview.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         preview.columnconfigure(1, weight=1)
         ttk.Label(preview, text="命令预览：").grid(row=0, column=0, sticky="w")
-        self._readonly_entry(preview, self.preview_var, 98).grid(row=0, column=1, sticky="ew")
+        self._readonly_entry(preview, self.preview_var, 1).grid(row=0, column=1, sticky="ew")
 
-        self.air_family_var = tk.StringVar(value="00")
+        self._effect_labels = {'off':'熄灭','solid':'常亮','slow':'慢闪','medium':'中闪','fast':'快闪','hold':'保持','fade_in':'Fade in','fade_out':'Fade out'}
+        effects = tuple(dict.fromkeys(effect for plugin in self.engine.registry.plugins.values() for effect in plugin.capabilities.effects))
+        self._effect_ids = {label:effect for effect,label in self._effect_labels.items() if effect in effects}
+        self._effect_ids.update({effect:effect for effect in effects if effect not in self._effect_labels})
+        self._protocol_names = {plugin.display_name: key for key, plugin in self.engine.registry.plugins.items()}
+        self.air_family_var = tk.StringVar(value=self.engine.protocol.display_name)
         family = ttk.Frame(tab)
         family.grid(row=1, column=0, sticky="ew", pady=(0, 5))
-        ttk.Label(family, text="命令族：").grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(family, text="00", variable=self.air_family_var, value="00").grid(row=0, column=1, sticky="w")
-        ttk.Radiobutton(family, text="D8", variable=self.air_family_var, value="D8").grid(row=0, column=2, sticky="w", padx=(12, 0))
-        self.d8_hex_var = tk.StringVar(value="#FF0000")
-        self.d8_hex_label = ttk.Label(family, text="D8 RGB：")
-        self.d8_hex_entry = ttk.Entry(family, textvariable=self.d8_hex_var, width=12)
-        self.d8_hex_label.grid(row=0, column=3, sticky="e", padx=(26, 4))
-        self.d8_hex_entry.grid(row=0, column=4, sticky="w")
+        ttk.Label(family, text='协议：').grid(row=0, column=0, sticky='w')
+        ttk.Combobox(family, textvariable=self.air_family_var, values=tuple(self._protocol_names), state='readonly', width=18).grid(row=0, column=1)
+        self.rgb_hex_var = tk.StringVar(value="#FF0000")
+        self.rgb_hex_label = ttk.Label(family, text="RGB：")
+        self.rgb_hex_entry = ttk.Entry(family, textvariable=self.rgb_hex_var, width=12)
+        self.rgb_hex_label.grid(row=0, column=3, sticky="e", padx=(26, 4))
+        self.rgb_hex_entry.grid(row=0, column=4, sticky="w")
+        self.capabilities_var = tk.StringVar(value='')
+        self.capabilities_label = ttk.Label(family, textvariable=self.capabilities_var, style='Muted.TLabel', wraplength=650)
+        self.capabilities_label.grid(row=1, column=0, columnspan=5, sticky='w', pady=(4,0))
 
         zones = ttk.Frame(tab)
         zones.grid(row=2, column=0, sticky="ew", pady=(0, 7))
         ttk.Label(zones, text="组别：").grid(row=0, column=0, sticky="w")
         self.all_zones_var = tk.BooleanVar(value=False)
-        self.zone_vars = {chr(ord("A") + index): tk.BooleanVar(value=index == 0) for index in range(16)}
+        self.zone_vars = {zone: tk.BooleanVar(value=index == 0) for index, zone in enumerate(dict.fromkeys(z for p in self.engine.registry.plugins.values() for z in p.capabilities.zones))}
         self.zone_buttons: list[ttk.Checkbutton] = []
         all_button = ttk.Checkbutton(zones, text="全选", variable=self.all_zones_var, command=self._toggle_all_zones)
         all_button.grid(row=0, column=1, sticky="w", padx=(0, 5))
         self.zone_buttons.append(all_button)
         for index, (zone, variable) in enumerate(self.zone_vars.items(), start=2):
             button = ttk.Checkbutton(zones, text=zone, variable=variable, command=self._zone_changed)
-            button.grid(row=0, column=index, sticky="w", padx=1)
+            button.grid(row=index // 18, column=index % 18, sticky="w", padx=1)
             self.zone_buttons.append(button)
 
         body = ttk.Frame(tab)
@@ -384,7 +417,7 @@ class LightstickApp(tk.Tk):
             functions.columnconfigure(column, weight=1)
         self.command_state_var = tk.StringVar(value="常亮")
         self.function_buttons: dict[str, ttk.Button] = {}
-        states = ("熄灭", "常亮", "慢闪", "中闪", "快闪", "保持", "Fade in", "Fade out")
+        states = tuple(self._effect_ids)
         for index, state in enumerate(states):
             button = ttk.Button(
                 functions,
@@ -394,21 +427,22 @@ class LightstickApp(tk.Tk):
             )
             button.grid(row=index // 2, column=index % 2, sticky="ew", padx=3, pady=3)
             self.function_buttons[state] = button
-        ttk.Separator(functions, orient="horizontal").grid(row=4, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Separator(functions, orient="horizontal").grid(row=(len(states)+1)//2, column=0, columnspan=2, sticky="ew", pady=4)
         ttk.Button(
             functions,
             text="所有分区变色",
             style="Small.TButton",
             command=self.open_c0_dialog,
-        ).grid(row=5, column=0, columnspan=2, sticky="ew", padx=3, pady=3)
+        ).grid(row=(len(states)+1)//2+1, column=0, columnspan=2, sticky="ew", padx=3, pady=3)
         ttk.Button(functions, text="脉冲", style="Small.TButton", command=self._send_a6).grid(
-            row=6, column=1, sticky="ew", padx=3, pady=3
+            row=(len(states)+1)//2+2, column=1, sticky="ew", padx=3, pady=3
         )
         ttk.Button(functions, text="解锁", style="Small.TButton", command=self._send_da).grid(
-            row=6, column=0, sticky="ew", padx=3, pady=3
+            row=(len(states)+1)//2+2, column=0, sticky="ew", padx=3, pady=3
         )
 
         colors = ttk.LabelFrame(body, text="颜色", padding=(9, 7))
+        self.colors_frame = colors
         colors.grid(row=0, column=1, sticky="nsew")
         for column in range(4):
             colors.columnconfigure(column, weight=1)
@@ -448,59 +482,98 @@ class LightstickApp(tk.Tk):
         self.power_label = ttk.Label(settings, text="-20 dBm", width=8)
         self.power_label.grid(row=0, column=9, sticky="w", padx=(5, 0))
         self.air_activity_var = tk.StringVar(value="准备就绪")
-        ttk.Label(tab, textvariable=self.air_activity_var, style="Muted.TLabel").grid(
+        ttk.Label(tab, textvariable=self.air_activity_var, style="Muted.TLabel", wraplength=780).grid(
             row=5, column=0, sticky="w", pady=(5, 0)
         )
 
         self.air_family_var.trace_add("write", lambda *_: self._family_changed())
         self.color_var.trace_add("write", lambda *_: self._color_changed())
-        self.d8_hex_var.trace_add("write", lambda *_: self.refresh_preview())
+        self.rgb_hex_var.trace_add("write", lambda *_: self.refresh_preview())
         self.air_power_var.trace_add("write", lambda *_: self._update_power_label())
         self._family_changed()
 
+    def _build_external_tab(self):
+        tab = self.external_tab
+        tab.columnconfigure(0, weight=1)
+        connection = ttk.LabelFrame(tab, text='控制来源', padding=14)
+        connection.grid(row=0, column=0, sticky='ew')
+        connection.columnconfigure(1, weight=1)
+        self._connector_names = {'关闭': None, **{p.display_name: key for key,p in self.server_manager.registry.plugins.items()}}
+        saved = self._startup_state
+        self.connector_var = tk.StringVar(value=next((name for name,key in self._connector_names.items() if key == saved['selected_connector']), '关闭'))
+        ttk.Label(connection, text='外部控制').grid(row=0, column=0, padx=(0,12))
+        selector = ttk.Combobox(connection, textvariable=self.connector_var, values=tuple(self._connector_names), state='readonly', width=22)
+        selector.grid(row=0, column=1, sticky='w')
+        selector.bind('<<ComboboxSelected>>', lambda event: self._switch_connector())
+        ttk.Button(connection, text='启动 / 配置', command=self._configure_connector).grid(row=0, column=2, padx=8)
+        ttk.Button(connection, text='停止', command=self._stop_connector).grid(row=0, column=3)
+        self.external_status_var = tk.StringVar(value='未启动')
+        ttk.Label(connection, textvariable=self.external_status_var, wraplength=700).grid(row=1, column=0, columnspan=4, sticky='w', pady=(12,0))
+        bridge = ttk.LabelFrame(tab, text='发射状态', padding=14)
+        bridge.grid(row=1, column=0, sticky='ew', pady=14)
+        self.external_bridge_var = tk.StringVar(value='Bridge 未连接')
+        ttk.Label(bridge, textvariable=self.external_bridge_var, wraplength=700).grid(row=0, column=0, sticky='w')
+        self.external_tx_var = tk.StringVar(value='等待输入')
+        ttk.Label(bridge, textvariable=self.external_tx_var, wraplength=700).grid(row=1, column=0, sticky='w', pady=(8,0))
+        statistics = ttk.LabelFrame(tab, text='运行统计', padding=14)
+        statistics.grid(row=2, column=0, sticky='ew')
+        self.external_metrics_var = tk.StringVar(value='')
+        ttk.Label(statistics, textvariable=self.external_metrics_var, justify='left', wraplength=700).grid(row=0, column=0, sticky='w')
+
     def _toggle_all_zones(self) -> None:
         selected = self.all_zones_var.get()
-        active_zones = D8_ZONES if self.air_family_var.get() == "D8" else tuple(self.zone_vars)
+        active_zones = self.engine.protocol.capabilities.zones
         for zone, variable in self.zone_vars.items():
             variable.set(selected if zone in active_zones else False)
         self.refresh_preview()
 
     def _zone_changed(self) -> None:
-        active_zones = D8_ZONES if self.air_family_var.get() == "D8" else tuple(self.zone_vars)
+        active_zones = self.engine.protocol.capabilities.zones
         self.all_zones_var.set(all(self.zone_vars[zone].get() for zone in active_zones))
         self.refresh_preview()
 
-    def _family_changed(self) -> None:
-        is_d8 = self.air_family_var.get() == "D8"
-        # D8's nine position-based candidates are A-I.  Keep the A-P
-        # controls visible for the short 00/DA commands, but make J-P
-        # unavailable while D8 is selected.
-        self.zone_buttons[0].state(["!disabled"])
+    def _family_changed(self):
+        if getattr(self, '_reverting_protocol', False):
+            return
+        selected = self._protocol_names[self.air_family_var.get()]
+        try:
+            self.engine.select_protocol(selected, blocking=False)
+        except Exception as exc:
+            self.air_activity_var.set(str(exc))
+            self._reverting_protocol = True
+            self.air_family_var.set(self.engine.protocol.display_name)
+            self._reverting_protocol = False
+            return
+        caps = self.engine.protocol.capabilities
         for zone, button in zip(self.zone_vars, self.zone_buttons[1:]):
-            button.state(["disabled"] if is_d8 and zone not in D8_ZONES else ["!disabled"])
-        if is_d8:
-            for zone in self.zone_vars:
-                if zone not in D8_ZONES:
-                    self.zone_vars[zone].set(False)
-        if is_d8:
-            self.d8_hex_label.grid()
-            self.d8_hex_entry.grid()
-            self.d8_hex_entry.configure(state="normal")
-        else:
-            self.d8_hex_label.grid_remove()
-            self.d8_hex_entry.grid_remove()
-            self.d8_hex_entry.configure(state="disabled")
-        for state, button in self.function_buttons.items():
-            button.state(["disabled"] if is_d8 and state in D8_DISABLED_STATES else ["!disabled"])
-        if is_d8 and self.command_state_var.get() in D8_DISABLED_STATES:
-            self.command_state_var.set("常亮")
-        if is_d8:
-            self.d8_hex_var.set(palette_hex(self.color_var.get()))
+            button.state(['!disabled'] if zone in caps.zones else ['disabled'])
+            if zone not in caps.zones:
+                self.zone_vars[zone].set(False)
+        for widget in (self.rgb_hex_label, self.rgb_hex_entry):
+            widget.grid() if caps.color_mode == 'rgb' else widget.grid_remove()
+        effects = self._effect_ids
+        for label, button in self.function_buttons.items():
+            button.state(['!disabled'] if effects[label] in caps.effects else ['disabled'])
+        unsupported = [label for label,effect in effects.items() if effect not in caps.effects]
+        self.capabilities_var.set('当前协议不支持：' + '、'.join(unsupported) if unsupported else '')
+        self.capabilities_label.grid() if unsupported else self.capabilities_label.grid_remove()
+        if effects[self.command_state_var.get()] not in caps.effects:
+            self.command_state_var.set(next(label for label,effect in effects.items() if effect in caps.effects))
+        for button in self.color_buttons:
+            button.destroy()
+        options = tuple((code,name) for code,name,_ in caps.palette) or COLOR_OPTIONS
+        if self.color_var.get() not in {code for code,_ in options}:
+            self.color_var.set(options[0][0])
+        self.color_buttons = []
+        for index,(code,name) in enumerate(options):
+            button = ttk.Radiobutton(self.colors_frame, text=name, variable=self.color_var, value=code)
+            button.grid(row=index//4, column=index%4, sticky='w', padx=3, pady=2)
+            self.color_buttons.append(button)
         self._zone_changed()
 
-    def _color_changed(self) -> None:
-        if self.air_family_var.get() == "D8":
-            self.d8_hex_var.set(palette_hex(self.color_var.get()))
+    def _color_changed(self):
+        colors = {code:color for code,_,color in self.engine.protocol.capabilities.palette}
+        self.rgb_hex_var.set(colors.get(self.color_var.get()) or palette_hex(self.color_var.get()))
         self.refresh_preview()
 
     def _update_power_label(self) -> None:
@@ -509,38 +582,21 @@ class LightstickApp(tk.Tk):
     def _selected_zones(self) -> list[str]:
         return [zone for zone, variable in self.zone_vars.items() if variable.get()]
 
-    def _selected_d8_zones(self) -> list[str]:
-        return [zone for zone in D8_ZONES if self.zone_vars[zone].get()]
-
-    def _current_d8_word(self) -> int:
-        state_name = self.command_state_var.get()
-        function = D8_FUNCTIONS.get(state_name)
-        if state_name == "熄灭":
-            red = green = blue = function = 0
-        elif function is None:
-            raise ValueError("D8 仅支持熄灭、常亮和三档闪烁")
+    def _current_update(self):
+        effect = self._effect_ids[self.command_state_var.get()]
+        caps = self.engine.protocol.capabilities
+        palette = self.color_var.get() if caps.color_mode == 'palette' else None
+        if palette is not None:
+            colors = {code:color for code,_,color in caps.palette}
+            rgb = rgb_from_hex(colors.get(palette) or palette_hex(palette))
+        elif effect == 'off':
+            rgb = (0, 0, 0)
         else:
-            red, green, blue = d8_rgb_from_hex(self.d8_hex_var.get())
-        return d8_word(red, green, blue, function)
+            rgb = rgb_from_hex(self.rgb_hex_var.get())
+        return LogicalUpdate(tuple(self._selected_zones()), rgb, effect, palette)
 
-    def _load_persistent_d8_slots(self) -> tuple[int, ...]:
-        slots = tuple(self._state_store.load_unlocked()["d8_slots"])
-        self._d8_slots = slots
-        return slots
-
-    def _current_d8_slots(self) -> tuple[int, ...]:
-        return d8_update_slots(
-            self._load_persistent_d8_slots(),
-            self._selected_d8_zones(),
-            self._current_d8_word(),
-        )
-
-    def _current_frames(self) -> tuple[bytes, ...]:
-        if self.air_family_var.get() == "00":
-            mask1, mask2 = zone_mask(self._selected_zones())
-            state = COMMAND_STATES[self.command_state_var.get()]
-            return (build_partition_frame(mask1, mask2, 0xFF, state, self.color_var.get()),)
-        return build_d8_frames_from_slots(self._current_d8_slots(), DEFAULT_D8_PHASES)
+    def _current_frames(self):
+        return self.engine.preview(self._current_update()).frames
 
     def refresh_preview(self) -> None:
         try:
@@ -557,13 +613,6 @@ class LightstickApp(tk.Tk):
         self.refresh_preview()
         self._start_air_tx()
 
-    def _send_a6(self) -> None:
-        self._start_air_tx((build_a6_frame(self.color_var.get()),))
-
-    def _send_da(self) -> None:
-        mask1, mask2 = zone_mask(self._selected_zones())
-        self._start_air_tx((build_da_frame(mask1, mask2),))
-
     def _tx_settings(self) -> tuple[int, int, int, int]:
         frequency = int(self.air_frequency_var.get())
         repeat = int(self.air_repeat_var.get())
@@ -577,125 +626,29 @@ class LightstickApp(tk.Tk):
             raise ValueError("功率必须为 -30..10 dBm")
         return frequency, repeat, gap_us, power
 
-    def _start_air_tx(self, frames: tuple[bytes, ...] | None = None) -> None:
-        transport = self._connected_transport("无法发射")
-        if transport is None:
+    def _start_air_tx(self, frames=None):
+        if self._connected_transport('无法发射') is None:
             return
-        d8_transaction = self.air_family_var.get() == "D8" and frames is None
-        d8_zones: tuple[str, ...] | None = None
-        d8_control_word: int | None = None
+        if 'air-tx' in self._busy_tasks:
+            self.air_activity_var.set('正在发射，请等待本次完成')
+            return
         try:
-            frequency, repeat, gap_us, power = self._tx_settings()
-            if d8_transaction:
-                d8_zones = tuple(self._selected_d8_zones())
-                d8_control_word = self._current_d8_word()
-                # Validate the current shared state and preview candidate now;
-                # the worker reloads it under the process lock before TX.
-                d8_update_slots(self._load_persistent_d8_slots(), d8_zones, d8_control_word)
-                pulses = ()
+            frequency, repeat, gap, power = self._tx_settings()
+            radio = RadioSettings(frequency, power, repeat, gap)
+            if frames is None:
+                update = self._current_update()
+                self.engine.preview(update, radio)
+                operation = lambda: self.engine.execute_update(update, radio)
             else:
-                current = frames if frames is not None else self._current_frames()
-                pulses = tuple(encode_air_pulses(frame) for frame in current)
+                commands = [('TX_PULSES', tx_pulses_args(encode_air_pulses(frame), frequency, power, repeat, gap)) for frame in frames]
+                operation = lambda: self.engine.execute_commands(commands)
         except Exception as exc:
-            self._show_error("发射参数无效", str(exc))
+            self._show_error('发射参数无效', str(exc))
             return
-        if "air-tx" in self._busy_tasks:
-            self.air_activity_var.set("正在发射")
-            return
-
-        def operation() -> Any:
-            if d8_transaction:
-                assert d8_zones is not None and d8_control_word is not None
-                return self._execute_persistent_d8_tx(
-                    transport,
-                    d8_zones,
-                    d8_control_word,
-                    frequency,
-                    power,
-                    gap_us,
-                )
-            commands = [
-                (
-                    "TX_PULSES",
-                    tx_pulses_args(
-                        pulse,
-                        frequency,
-                        power,
-                        repeat if len(pulses) == 1 else 1,
-                        gap_us,
-                    ),
-                )
-                for pulse in pulses
-            ]
-            return self._execute_tx(transport, commands)
-
-        self.air_activity_var.set("正在发射并等待 TX 结果")
-        def completed(value: Any) -> None:
-            if d8_transaction:
-                self._d8_slots = value.candidate_slots
-                self.air_activity_var.set(d8_tx_completion_text(value.state_changed))
-                return
-            self.air_activity_var.set(f"发射完成：{len(value)} 个 TX 结果成功")
-
-        self._submit(
-            "air-tx",
-            operation,
-            "发射完成",
-            completed,
-            lambda detail: self.air_activity_var.set(f"发射失败：{detail}"),
-        )
-
-    def open_c0_dialog(self) -> None:
-        dialog = self._modal(self, "所有分区变色", "520x330")
-        draft = list(self.c0_colors)
-        zone_var = tk.StringVar(value="A")
-        color_var = tk.IntVar(value=draft[0])
-        preview_var = tk.StringVar()
-
-        content = ttk.Frame(dialog, padding=14)
-        content.pack(fill="both", expand=True)
-        content.columnconfigure(1, weight=1)
-        ttk.Label(content, text="命令预览：").grid(row=0, column=0, sticky="w")
-        self._readonly_entry(content, preview_var, 52).grid(row=0, column=1, columnspan=4, sticky="ew")
-        ttk.Label(content, text="组别：").grid(row=1, column=0, sticky="w", pady=(11, 4))
-        zone_box = ttk.Combobox(content, textvariable=zone_var, values=list("ABCDEFGHIJ"), state="readonly", width=7)
-        zone_box.grid(row=1, column=1, sticky="w", pady=(11, 4))
-        palette = ttk.LabelFrame(content, text="颜色", padding=(8, 6))
-        palette.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(3, 9))
-        for column in range(4):
-            palette.columnconfigure(column, weight=1)
-        for index, (code, name) in enumerate(COLOR_OPTIONS):
-            ttk.Radiobutton(palette, text=name, variable=color_var, value=code).grid(
-                row=index // 4, column=index % 4, sticky="w", padx=3, pady=2
-            )
-
-        def refresh() -> None:
-            selected = ord(zone_var.get()) - ord("A")
-            draft[selected] = color_var.get()
-            preview_var.set(hex_bytes(build_c0_frame(draft)))
-
-        def change_zone(*_: Any) -> None:
-            color_var.set(draft[ord(zone_var.get()) - ord("A")])
-            refresh()
-
-        zone_var.trace_add("write", change_zone)
-        color_var.trace_add("write", lambda *_: refresh())
-        refresh()
-        actions = ttk.Frame(content)
-        actions.grid(row=3, column=0, columnspan=5, sticky="e")
-        ttk.Button(actions, text="取消", command=dialog.destroy).grid(row=0, column=0, padx=(0, 6))
-
-        def send() -> None:
-            try:
-                frame = build_c0_frame(draft)
-            except Exception as exc:
-                self._show_error("C0 参数无效", str(exc))
-                return
-            self.c0_colors = draft
-            dialog.destroy()
-            self._start_air_tx((frame,))
-
-        ttk.Button(actions, text="发射", command=send).grid(row=0, column=1)
+        self.air_activity_var.set('正在发射并等待 TX 结果')
+        self._submit('air-tx', operation, '发射完成',
+                     lambda value: self.air_activity_var.set('Bridge 发射完成；无目标 ACK'),
+                     lambda detail: self.air_activity_var.set('发射失败：' + detail))
 
     def _build_esp_tab(self) -> None:
         tab = self.esp_tab
@@ -746,26 +699,17 @@ class LightstickApp(tk.Tk):
         return self.transport
 
     def _execute_tx(self, transport: BaseTransport, commands: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
-        return Controller(transport).execute_commands(commands)
+        return self.engine.execute_commands(commands)
 
-    def _execute_persistent_d8_tx(
-        self,
-        transport: BaseTransport,
-        zones: tuple[str, ...],
-        word: int,
-        frequency_hz: int,
-        power_dbm: int,
-        gap_us: int,
-    ) -> Any:
-        return execute_persistent_d8_tx(
-            self._state_store,
-            transport,
-            zones,
-            word,
-            frequency_hz,
-            power_dbm,
-            gap_us,
-        )
+    def _connect_owned_transport(self, transport):
+        try:
+            status = transport.connect()
+            self.engine.attach(transport)
+            self.engine.start()
+            return status
+        except Exception:
+            transport.disconnect()
+            raise
 
     def scan_serial_and_connect(self) -> None:
         def operation() -> dict[str, Any]:
@@ -775,7 +719,7 @@ class LightstickApp(tk.Tk):
                 raise TransportError("未找到可用串口")
             port = str(selected.get("device") or "")
             transport = SerialTransport(port, 921600)
-            return {"ports": ports, "transport": transport, "status": transport.connect()}
+            return {"ports": ports, "transport": transport, "status": self._connect_owned_transport(transport)}
 
         self._submit("scan-serial", operation, "串口已连接", self._connected_from_scan)
 
@@ -787,7 +731,7 @@ class LightstickApp(tk.Tk):
                 raise TransportError(f"未找到 {BLE_DEVICE_NAME}")
             address = str(device.get("address") or "")
             transport = BleTransport(address)
-            status = transport.connect()
+            status = self._connect_owned_transport(transport)
             try:
                 network = transport.request("GET_NETWORK_STATUS", {}, timeout=8)
             except Exception as exc:
@@ -804,7 +748,6 @@ class LightstickApp(tk.Tk):
         if not isinstance(transport, BaseTransport):
             self._show_error("连接失败", "传输实例无效")
             return
-        old = self.transport
         self.transport = transport
         self._update_transport_status(result["status"])
         if result["status"].kind == "USB Serial":
@@ -814,8 +757,6 @@ class LightstickApp(tk.Tk):
             url = http_url_from_network_status(result.get("network"))
             if url:
                 self.http_url_var.set(url)
-        if old is not None and old is not transport:
-            threading.Thread(target=self._best_effort_disconnect, args=(old,), daemon=True).start()
         self.refresh_bridge_status()
 
     @staticmethod
@@ -833,7 +774,7 @@ class LightstickApp(tk.Tk):
 
         def operation() -> dict[str, Any]:
             transport = HttpTransport(url)
-            return {"transport": transport, "status": transport.connect()}
+            return {"transport": transport, "status": self._connect_owned_transport(transport)}
 
         self._submit("connect-http", operation, "HTTP 已连接", self._connected_from_scan)
 
@@ -843,11 +784,10 @@ class LightstickApp(tk.Tk):
             return
 
         def finished(status: Any) -> None:
-            if isinstance(status, TransportStatus):
-                self._update_transport_status(status)
+            self._update_transport_status(TransportStatus(self.transport_status.kind, False, "已断开"))
             self.transport = None
 
-        self._submit("disconnect", transport.disconnect, "已断开", finished)
+        self._submit("disconnect", self.engine.disconnect, "已断开", finished)
 
     def refresh_bridge_status(self) -> None:
         transport = self._connected_transport("无法刷新状态")
@@ -1308,10 +1248,13 @@ class LightstickApp(tk.Tk):
             if event.task in {"recording", "record-recovery"}:
                 self._finish_recording(event.value)
             if callback:
-                callback(event.value)
+                try:
+                    callback(event.value)
+                except Exception as exc:
+                    self._show_error('操作结果处理失败', str(exc))
             if message:
                 self.esp_activity_var.set(message)
-        self.after(80, self._poll_worker_events)
+        self._worker_after_id = self.after(80, self._poll_worker_events)
 
     def _handle_progress(self, event: WorkerEvent) -> None:
         if event.task not in {"recording", "record-recovery"} or not isinstance(event.value, dict):
@@ -1346,13 +1289,24 @@ class LightstickApp(tk.Tk):
         except tk.TclError:
             pass
 
-    def _close(self) -> None:
-        transport = self.transport
+    def _close(self):
+        for name in ('_worker_after_id', '_status_after_id'):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                self.after_cancel(timer)
+                setattr(self, name, None)
+        self.server_manager.close()
+        self.engine.stop()
         self.transport = None
-        if transport is not None:
-            threading.Thread(target=self._best_effort_disconnect, args=(transport,), daemon=True).start()
         self.destroy()
 
 
 def run() -> None:
     LightstickApp().mainloop()
+
+# Historical import compatibility; not used by the active controls.
+def __getattr__(name):
+    from . import _legacy_ui
+    if hasattr(_legacy_ui, name):
+        return getattr(_legacy_ui, name)
+    raise AttributeError(name)
