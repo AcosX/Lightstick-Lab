@@ -2,4 +2,4 @@
 # Copyright (C) 2026 lightstick-control contributors
 """Lightstick control GUI and headless ESP32 bridge client."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

@@ -6,6 +6,8 @@ REPO_DIR=$(dirname "$SCRIPT_DIR")
 BUILD_DIR=$(mktemp -d /tmp/lightstick-release.XXXXXX)
 VERSION=0.5.0
 ARCH=$(uname -m)
+SOURCE_VERSION=$(PYTHONPATH="$REPO_DIR/python" python3 -c 'from lightstick_demo import __version__; print(__version__)')
+[ "$SOURCE_VERSION" = "$VERSION" ] || { echo 'Source/package version mismatch' >&2; exit 1; }
 export COPYFILE_DISABLE=1
 python3 -m PyInstaller --noconfirm --clean --distpath "$BUILD_DIR/dist" --workpath "$BUILD_DIR/build" "$SCRIPT_DIR/lightstick_demo.spec"
 APP="$BUILD_DIR/dist/LightstickLab.app"
